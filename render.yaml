@@ -1,0 +1,50 @@
+services:
+  - type: web
+    name: northstar-crm-api
+    runtime: node
+    plan: free
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: 24.21.0
+      - key: NODE_ENV
+        value: production
+      - key: AUTH_MODE
+        value: supabase
+      - key: FRONTEND_ORIGIN
+        sync: false
+      - key: PUBLIC_API_URL
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: ENCRYPTION_KEY
+        sync: false
+      - key: EMAIL_PROVIDER
+        value: gmail
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: AWS_REGION
+        sync: false
+      - key: AWS_ACCESS_KEY_ID
+        sync: false
+      - key: AWS_SECRET_ACCESS_KEY
+        sync: false
+      - key: AWS_SES_FROM_EMAIL
+        sync: false
+      - key: AWS_SES_CONFIGURATION_SET
+        sync: false
+      - key: RESEND_API_KEY
+        sync: false
+      - key: RESEND_FROM_EMAIL
+        sync: false
+      - key: RESEND_WEBHOOK_SECRET
+        sync: false
