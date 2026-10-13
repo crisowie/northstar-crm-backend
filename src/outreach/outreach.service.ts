@@ -69,6 +69,20 @@ type ClickLink = { token: string; user_id: string; message_id: string; target_ur
 type OAuthTokens = { access_token: string; expires_in?: number; refresh_token?: string; error?: string; error_description?: string };
 type GmailMessage = { internalDate?: string; payload?: { headers?: { name?: string; value?: string }[] } };
 type GmailHistoryItem = { messagesAdded?: Array<{ message?: { id?: string; threadId?: string } }> };
+type CalendarMeetingRow = {
+  user_id: string;
+  cal_uid: string;
+  contact_id: string | null;
+  title: string;
+  attendee_name: string;
+  attendee_email: string;
+  start_time: string;
+  end_time: string;
+  location: string | null;
+  status: "booked" | "cancelled" | "rescheduled";
+  created_at: string;
+  updated_at: string;
+};
 
 const providerIds: EmailProviderId[] = ["gmail", "ses", "resend"];
 const eventTypes = new Set(["queued", "sending", "sent", "provider_accepted", "delivered", "bounced", "complaint", "failed", "opened", "clicked", "reply_received", "unsubscribed"]);
@@ -121,6 +135,8 @@ export class OutreachService {
   private readonly volatileProviderPreferences = new Map<string, { provider: EmailProviderId; paused: boolean }>();
   private readonly volatileSuppressions = new Map<string, { user_id: string; email_address: string; reason: string; provider: EmailProviderId; created_at: string; source_event_id: string | null }>();
   private readonly volatileEvents: StoredEmailEvent[] = [];
+  private readonly volatileCalendarSecrets = new Map<string, string>();
+  private readonly volatileMeetings = new Map<string, CalendarMeetingRow[]>();
 
   constructor(@Inject(ConfigService) private readonly config: ConfigService, @Inject(WorkspaceService) private readonly workspaceService: WorkspaceService) {
     const url = config.get<string>("SUPABASE_URL")?.trim();
@@ -518,7 +534,11 @@ export class OutreachService {
     authorization.searchParams.set("client_id", clientId);
     authorization.searchParams.set("redirect_uri", this.redirectUri);
     authorization.searchParams.set("response_type", "code");
-    authorization.searchParams.set("scope", ["https://www.googleapis.com/auth/gmail.send", "https://www.googleapis.com/auth/gmail.metadata"].join(" "));
+    authorization.searchParams.set("scope", [
+      "https://www.googleapis.com/auth/gmail.send",
+      "https://www.googleapis.com/auth/gmail.metadata",
+      "https://www.googleapis.com/auth/gmail.readonly",
+    ].join(" "));
     authorization.searchParams.set("access_type", "offline");
     authorization.searchParams.set("prompt", "consent");
     authorization.searchParams.set("include_granted_scopes", "true");
@@ -703,6 +723,238 @@ export class OutreachService {
 
   async getMessages(userId: string) {
     return (await this.getRows(userId)).map((row) => this.toMessage(row));
+  }
+
+  private decodeGmailBody(value: string) {
+    return Buffer.from(value.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8");
+  }
+
+  private gmailBody(payload: Record<string, unknown>): string {
+    const body = isRecord(payload.body) ? payload.body : {};
+    const data = typeof body.data === "string" ? body.data : "";
+    const mimeType = String(payload.mimeType || "");
+    if (mimeType === "text/plain" && data) return this.decodeGmailBody(data);
+    const parts = Array.isArray(payload.parts) ? payload.parts.filter(isRecord) : [];
+    const plainParts = parts.filter((part) => part.mimeType === "text/plain");
+    if (plainParts.length) return plainParts.map((part) => this.gmailBody(part)).filter(Boolean).join("\n").trim();
+    const nested = parts.map((part) => this.gmailBody(part)).find(Boolean);
+    if (nested) return nested;
+    if (mimeType === "text/html" && data) {
+      return this.decodeGmailBody(data)
+        .replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1>/gi, "")
+        .replace(/<br\s*\/?>|<\/p>|<\/div>/gi, "\n")
+        .replace(/<[^>]*>/g, "")
+        .replace(/&nbsp;/gi, " ")
+        .replace(/&amp;/gi, "&")
+        .replace(/&lt;/gi, "<")
+        .replace(/&gt;/gi, ">")
+        .replace(/&quot;/gi, "\"")
+        .replace(/&#39;|&#x27;/gi, "'")
+        .trim();
+    }
+    return "";
+  }
+
+  async getMessageThread(userId: string, messageId: string) {
+    const row = (await this.getRows(userId)).find((message) => message.id === messageId);
+    if (!row) throw new NotFoundException("This outreach message was not found.");
+    const sentMessage = {
+      id: row.provider_message_id || row.id,
+      from: row.sender_account || "",
+      to: row.recipient,
+      subject: row.subject,
+      sentAt: row.sent_at || row.created_at || "",
+      body: row.body,
+      direction: "sent" as const,
+    };
+    const account = await this.getStoredAccount(userId);
+    const threadId = row.provider_thread_id || row.gmail_thread_id;
+    if (!account || !threadId) {
+      return { threadId: threadId || null, source: "crm", messages: [sentMessage] };
+    }
+
+    const accessToken = await this.getAccessToken(userId);
+    const url = new URL(`https://gmail.googleapis.com/gmail/v1/users/me/threads/${encodeURIComponent(threadId)}`);
+    url.searchParams.set("format", "full");
+    const response = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
+    if (response.status === 403) {
+      throw new ServiceUnavailableException("Gmail has not granted permission to read thread contents. Disconnect and reconnect Gmail to approve read-only access.");
+    }
+    if (!response.ok) throw new ServiceUnavailableException("Could not load this Gmail conversation. Reconnect Gmail and try again.");
+    const thread = await response.json() as {
+      messages?: Array<{
+        id?: string;
+        internalDate?: string;
+        payload?: Record<string, unknown> & { headers?: Array<{ name?: string; value?: string }> };
+      }>;
+    };
+    const messages = (thread.messages || []).map((message) => {
+      const headers = message.payload?.headers || [];
+      const header = (name: string) => headers.find((item) => item.name?.toLowerCase() === name.toLowerCase())?.value || "";
+      const from = header("From");
+      return {
+        id: message.id || "",
+        from,
+        to: header("To"),
+        subject: header("Subject") || row.subject,
+        sentAt: message.internalDate ? new Date(Number(message.internalDate)).toISOString() : "",
+        body: message.payload ? this.gmailBody(message.payload) : "",
+        direction: addressOf(from) === account.email_address.toLowerCase() ? "sent" as const : "received" as const,
+      };
+    }).filter((message) => message.id);
+    return { threadId, source: "gmail", messages: messages.length ? messages : [sentMessage] };
+  }
+
+  async getMeetings(userId: string) {
+    if (!this.storage) {
+      return [...(this.volatileMeetings.get(userId) || [])]
+        .sort((a, b) => b.start_time.localeCompare(a.start_time))
+        .map((row) => this.toCalendarMeeting(row));
+    }
+    const { data, error } = await this.storage.from("crm_calendar_bookings")
+      .select("user_id,cal_uid,contact_id,title,attendee_name,attendee_email,start_time,end_time,location,status,created_at,updated_at")
+      .eq("user_id", userId).order("start_time", { ascending: false }).limit(500);
+    if (error) throw new ServiceUnavailableException("Could not load calendar bookings.");
+    return ((data || []) as CalendarMeetingRow[]).map((row) => this.toCalendarMeeting(row));
+  }
+
+  private toCalendarMeeting(row: CalendarMeetingRow) {
+    return {
+      id: row.cal_uid,
+      contactId: row.contact_id || undefined,
+      title: row.title,
+      attendeeName: row.attendee_name,
+      attendeeEmail: row.attendee_email,
+      startTime: row.start_time,
+      endTime: row.end_time,
+      location: row.location || undefined,
+      status: row.status,
+    };
+  }
+
+  async getCalendarSettings(userId: string) {
+    let configured = this.volatileCalendarSecrets.has(userId);
+    if (this.storage) {
+      const { data, error } = await this.storage.from("crm_cal_webhook_configs").select("user_id").eq("user_id", userId).maybeSingle();
+      if (error) throw new ServiceUnavailableException("Could not load the Cal.com webhook configuration.");
+      configured = Boolean(data);
+    }
+    return {
+      configured,
+      webhookUrl: `${this.publicApiBase}/outreach/calendar/webhook/${encodeURIComponent(userId)}`,
+    };
+  }
+
+  async saveCalendarWebhookSecret(userId: string, value: unknown) {
+    if (!isRecord(value) || typeof value.secret !== "string" || value.secret.trim().length < 32) {
+      throw new BadRequestException("Enter the Cal.com webhook secret (at least 32 characters).");
+    }
+    const encryptedSecret = this.encrypt(value.secret.trim());
+    if (!this.storage) {
+      this.volatileCalendarSecrets.set(userId, encryptedSecret);
+      return { configured: true };
+    }
+    const { error } = await this.storage.from("crm_cal_webhook_configs").upsert({
+      user_id: userId, webhook_secret_encrypted: encryptedSecret, updated_at: new Date().toISOString(),
+    }, { onConflict: "user_id" });
+    if (error) throw new ServiceUnavailableException("Could not save the Cal.com webhook secret.");
+    return { configured: true };
+  }
+
+  async processCalWebhook(userId: string, rawBody: string, signature: string) {
+    if (!rawBody || !signature) throw new UnauthorizedException("The Cal.com webhook signature is missing.");
+    let encryptedSecret: string | undefined;
+    if (!this.storage) encryptedSecret = this.volatileCalendarSecrets.get(userId);
+    else {
+      const { data, error } = await this.storage.from("crm_cal_webhook_configs")
+        .select("webhook_secret_encrypted").eq("user_id", userId).maybeSingle();
+      if (error) throw new ServiceUnavailableException("Could not load the Cal.com webhook configuration.");
+      encryptedSecret = data?.webhook_secret_encrypted;
+    }
+    if (!encryptedSecret) throw new UnauthorizedException("Cal.com webhooks are not configured for this workspace.");
+    const expected = createHmac("sha256", this.decrypt(encryptedSecret)).update(rawBody).digest();
+    const received = Buffer.from(signature.replace(/^sha256=/i, ""), "hex");
+    if (received.length !== expected.length || !timingSafeEqual(received, expected)) {
+      throw new UnauthorizedException("The Cal.com webhook signature is invalid.");
+    }
+    let event: Record<string, unknown>;
+    try { event = JSON.parse(rawBody) as Record<string, unknown>; }
+    catch { throw new BadRequestException("The Cal.com webhook body is not valid JSON."); }
+    const trigger = String(event.triggerEvent || "").toUpperCase();
+    const payload = isRecord(event.payload) ? event.payload : event;
+    const uid = String(payload.uid || "");
+    if (!uid) return { received: true, processed: false, reason: "booking UID missing" };
+    if (trigger !== "BOOKING_CREATED" && trigger !== "BOOKING_RESCHEDULED" && trigger !== "BOOKING_CANCELLED" && trigger !== "BOOKING_REJECTED") {
+      return { received: true, processed: false, reason: "unsupported booking event" };
+    }
+    const now = new Date().toISOString();
+    if (trigger === "BOOKING_CANCELLED" || trigger === "BOOKING_REJECTED") {
+      await this.updateCalendarMeetingStatus(userId, uid, "cancelled");
+      return { received: true, processed: true };
+    }
+    const attendees = Array.isArray(payload.attendees) ? payload.attendees.filter(isRecord) : [];
+    const primary = attendees[0] || {};
+    const email = String(primary.email || "").trim().toLowerCase();
+    const contactName = [primary.firstName, primary.lastName].filter((part) => typeof part === "string" && part).join(" ")
+      || String(primary.name || "");
+    const startTime = String(payload.startTime || "");
+    const endTime = String(payload.endTime || "");
+    if (!email || !startTime || !endTime || !Number.isFinite(Date.parse(startTime)) || !Number.isFinite(Date.parse(endTime))) {
+      throw new BadRequestException("The Cal.com booking is missing a valid attendee email or meeting time.");
+    }
+    const workspace = await this.workspaceService.getWorkspace(userId);
+    const matchedContact = workspace.data.contacts.find((contact) => String(contact.email || "").trim().toLowerCase() === email);
+    const contactId = matchedContact ? String(matchedContact.id) : null;
+    const locationValue = payload.location;
+    const videoCallData = isRecord(payload.videoCallData) ? payload.videoCallData : {};
+    const metadata = isRecord(payload.metadata) ? payload.metadata : {};
+    const linkCandidate = [videoCallData.url, metadata.videoCallUrl, locationValue]
+      .find((value): value is string => typeof value === "string" && /^https?:\/\//i.test(value));
+    let meetingUrl: string | null = null;
+    if (linkCandidate) {
+      try {
+        const parsed = new URL(linkCandidate);
+        if (parsed.protocol === "https:" || parsed.protocol === "http:") meetingUrl = parsed.toString();
+      } catch {
+        meetingUrl = null;
+      }
+    }
+    const location = meetingUrl || (typeof locationValue === "string" && !locationValue.startsWith("integrations:") ? locationValue : null);
+    const rescheduleUid = String(payload.rescheduleUid || "");
+    if (rescheduleUid && rescheduleUid !== uid) await this.updateCalendarMeetingStatus(userId, rescheduleUid, "rescheduled");
+    await this.saveCalendarMeeting({
+      user_id: userId, cal_uid: uid, contact_id: contactId, title: String(payload.title || "Cal.com meeting"),
+      attendee_name: contactName, attendee_email: email, start_time: startTime, end_time: endTime,
+      location, status: "booked", created_at: now, updated_at: now,
+    });
+    return { received: true, processed: true };
+  }
+
+  private async saveCalendarMeeting(row: CalendarMeetingRow) {
+    if (!this.storage) {
+      const meetings = this.volatileMeetings.get(row.user_id) || [];
+      const index = meetings.findIndex((item) => item.cal_uid === row.cal_uid);
+      if (index >= 0) meetings[index] = { ...meetings[index], ...row, created_at: meetings[index].created_at };
+      else meetings.push(row);
+      this.volatileMeetings.set(row.user_id, meetings);
+      return;
+    }
+    const { error } = await this.storage.from("crm_calendar_bookings").upsert(row, { onConflict: "user_id,cal_uid" });
+    if (error) throw new ServiceUnavailableException("Could not save the Cal.com booking.");
+  }
+
+  private async updateCalendarMeetingStatus(userId: string, uid: string, status: CalendarMeetingRow["status"]) {
+    if (!this.storage) {
+      const existing = (this.volatileMeetings.get(userId) || []).find((item) => item.cal_uid === uid);
+      if (existing) {
+        existing.status = status;
+        existing.updated_at = new Date().toISOString();
+      }
+      return;
+    }
+    const { error } = await this.storage.from("crm_calendar_bookings")
+      .update({ status, updated_at: new Date().toISOString() }).eq("user_id", userId).eq("cal_uid", uid);
+    if (error) throw new ServiceUnavailableException("Could not update the rescheduled Cal.com booking.");
   }
 
   async getStats(userId: string) {

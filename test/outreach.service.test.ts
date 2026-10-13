@@ -29,6 +29,8 @@ function createService(values: Record<string, string> = {}) {
     volatileProviderPreferences: Map<string, { provider: string; paused: boolean }>;
     volatileSuppressions: Map<string, Record<string, unknown>>;
     volatileMessages: Map<string, Array<Record<string, unknown>>>;
+    volatileCalendarSecrets: Map<string, string>;
+    volatileMeetings: Map<string, Array<Record<string, unknown>>>;
   };
   state.volatileAccounts.set(userId, {
     user_id: userId,
@@ -96,6 +98,53 @@ test("Gmail regression: reply sync reads Gmail metadata and correlates by sender
     assert.equal(row.status, "replied");
     assert.ok(row.replied_at);
     assert.equal(row.body, "tracked body");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("Gmail thread view loads full message bodies only after read-only authorization", async () => {
+  const { service, state } = createService();
+  const messageId = randomUUID();
+  state.volatileMessages.set(userId, [{
+    id: messageId, user_id: userId, contact_id: contact.id, opportunity_id: null,
+    recipient: contact.email, recipient_name: "Jamie Client", subject: "A proposal", body: "Stored sent body",
+    status: "replied", sent_at: new Date().toISOString(), replied_at: null,
+    gmail_message_id: "gmail-message-thread", gmail_thread_id: "gmail-thread-full", provider: "gmail",
+    sender_account: "sender@example.test", provider_message_id: "gmail-message-thread", provider_thread_id: "gmail-thread-full",
+    provider_capabilities: emailProviders.gmail.capabilities({ senderEmail: "sender@example.test" }),
+    idempotency_key: messageId, recipient_opted_in: false, click_count: 0, created_at: new Date().toISOString(),
+  }]);
+  state.volatileAccounts.set(userId, {
+    user_id: userId, email_address: "sender@example.test",
+    refresh_token_encrypted: state.encrypt("refresh-token"),
+    access_token_encrypted: state.encrypt("test-access-token"),
+    access_token_expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+    history_id: "100",
+  });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    assert.match(String(input), /threads\/gmail-thread-full\?format=full/);
+    assert.match(String((init?.headers as Record<string, string>).Authorization), /test-access-token/);
+    return Response.json({ messages: [{
+      id: "reply-1", internalDate: String(Date.now()),
+      payload: {
+        mimeType: "text/plain",
+        headers: [
+          { name: "From", value: "Jamie Client <jamie@example.test>" },
+          { name: "To", value: "sender@example.test" },
+          { name: "Subject", value: "Re: A proposal" },
+        ],
+        body: { data: Buffer.from("Thanks, let's talk.").toString("base64url") },
+      },
+    }] });
+  };
+  try {
+    const result = await service.getMessageThread(userId, messageId);
+    assert.equal(result.source, "gmail");
+    assert.equal(result.messages.length, 1);
+    assert.equal(result.messages[0].direction, "received");
+    assert.equal(result.messages[0].body, "Thanks, let's talk.");
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -214,10 +263,64 @@ test("Resend webhook signatures are verified and duplicate event IDs are process
   assert.equal(state.volatileEvents.filter((event) => event.provider_event_id === id).length, 1);
 });
 
+test("Cal.com bookings require valid signatures, link contacts, and preserve reschedule and cancellation history", async () => {
+  const { service, state } = createService();
+  const secret = "a-cal-webhook-secret-with-at-least-32-characters";
+  await service.saveCalendarWebhookSecret(userId, { secret });
+  const booking = {
+    triggerEvent: "BOOKING_CREATED",
+    createdAt: new Date().toISOString(),
+    payload: {
+      uid: "cal-booking-1",
+      title: "30 minute meeting",
+      startTime: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+      endTime: new Date(Date.now() + 90 * 60 * 1000).toISOString(),
+      attendees: [{ email: contact.email, name: "Jamie Client" }],
+      location: "https://meet.example.test/room",
+    },
+  };
+  const rawBody = JSON.stringify(booking);
+  const signature = createHmac("sha256", secret).update(rawBody).digest("hex");
+  await assert.rejects(service.processCalWebhook(userId, rawBody, "bad-signature"), UnauthorizedException);
+  await service.processCalWebhook(userId, rawBody, signature);
+  let meetings = await service.getMeetings(userId);
+  assert.equal(meetings.length, 1);
+  assert.equal(meetings[0].contactId, contact.id);
+  assert.equal(meetings[0].attendeeEmail, contact.email);
+  assert.equal(meetings[0].status, "booked");
+
+  const rescheduled = {
+    ...booking,
+    triggerEvent: "BOOKING_RESCHEDULED",
+    payload: {
+      ...booking.payload,
+      uid: "cal-booking-2",
+      rescheduleUid: "cal-booking-1",
+      startTime: new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString(),
+      endTime: new Date(Date.now() + 150 * 60 * 1000).toISOString(),
+    },
+  };
+  const rescheduledBody = JSON.stringify(rescheduled);
+  await service.processCalWebhook(userId, rescheduledBody, createHmac("sha256", secret).update(rescheduledBody).digest("hex"));
+  meetings = await service.getMeetings(userId);
+  assert.equal(meetings.find((meeting) => meeting.id === "cal-booking-1")?.status, "rescheduled");
+  assert.equal(meetings.find((meeting) => meeting.id === "cal-booking-2")?.status, "booked");
+
+  const cancelled = { ...rescheduled, triggerEvent: "BOOKING_CANCELLED" };
+  const cancelledBody = JSON.stringify(cancelled);
+  await service.processCalWebhook(userId, cancelledBody, createHmac("sha256", secret).update(cancelledBody).digest("hex"));
+  meetings = await service.getMeetings(userId);
+  assert.equal(meetings.find((meeting) => meeting.id === "cal-booking-2")?.status, "cancelled");
+  assert.equal(meetings.find((meeting) => meeting.id === "cal-booking-2")?.contactId, contact.id);
+});
+
 test("provider migration is additive and preserves existing message and tracking tables", () => {
   const migration = readFileSync(new URL("../supabase/migrations/004_email_providers.sql", import.meta.url), "utf8");
   assert.match(migration, /alter table public\.crm_outreach_messages\s+add column if not exists provider/is);
   assert.match(migration, /create table if not exists public\.crm_email_events/is);
   assert.match(migration, /create or replace function public\.record_outreach_click/is);
   assert.doesNotMatch(migration, /\bdrop\s+table\b|\btruncate\b|\bdrop\s+schema\b/i);
+  const calendarMigration = readFileSync(new URL("../supabase/migrations/005_cal_bookings.sql", import.meta.url), "utf8");
+  assert.match(calendarMigration, /create table if not exists public\.crm_calendar_bookings/is);
+  assert.match(calendarMigration, /create table if not exists public\.crm_cal_webhook_configs/is);
 });

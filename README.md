@@ -10,7 +10,7 @@ Copy-Item .env.example .env
 npm run start:dev
 ```
 
-The API listens on `http://localhost:5000/api`. Keep OAuth/API credentials in this API's environment only. Apply migrations `001_crm_workspaces.sql`, `002_crm_domain_tables.sql`, `003_gmail_outreach.sql`, and `004_email_providers.sql` in order if they have not already been applied. Migration 004 is additive: it preserves CRM tables, Gmail accounts, messages, reply history, and tracked links.
+The API listens on `http://localhost:5000/api`. Keep OAuth/API credentials in this API's environment only. Apply migrations `001_crm_workspaces.sql`, `002_crm_domain_tables.sql`, `003_gmail_outreach.sql`, `004_email_providers.sql`, and `005_cal_bookings.sql` in order if they have not already been applied. Migrations 004 and 005 are additive.
 
 ## Gmail mailbox
 
@@ -19,9 +19,9 @@ The API listens on `http://localhost:5000/api`. Keep OAuth/API credentials in th
 3. Set `PUBLIC_API_URL` to the public API base URL including `/api`. Click tracking and webhooks require a reachable HTTPS URL in production.
 4. Connect Gmail from Outreach or Email Providers settings.
 
-The integration keeps the existing `gmail.send` and `gmail.metadata` scopes. It sends via Gmail, synchronizes replies from Gmail metadata headers without downloading bodies, and stores Gmail IDs separately from the normalized message and provider IDs. Messages sent through SES or Resend can be correlated to a Gmail reply when Gmail is connected, replies are addressed to that mailbox, and From/To/Subject headers identify the original conversation. This cross-provider match is header-based and can be ambiguous when the same recipient receives multiple messages with the same subject.
+The integration requests `gmail.send`, `gmail.metadata`, and `gmail.readonly`. It sends via Gmail, synchronizes replies from metadata headers, and loads full message bodies only when an authorized user opens an outreach thread. Gmail IDs are stored separately from normalized message and provider IDs. Messages sent through SES or Resend can be correlated to a Gmail reply when Gmail is connected, replies are addressed to that mailbox, and From/To/Subject headers identify the original conversation. This cross-provider match is header-based and can be ambiguous when the same recipient receives multiple messages with the same subject. Existing Gmail connections must be disconnected and re-authorized to grant read-only access; do not enable thread-content viewing unless the mailbox owner approves this broader access.
 
-Google classifies `gmail.send` as sensitive and `gmail.metadata` as restricted. Configure the OAuth consent screen and verification for the deployment and user audience. See [Gmail API scopes](https://developers.google.com/workspace/gmail/api/auth/scopes).
+Google classifies `gmail.send` as sensitive, and `gmail.metadata` and `gmail.readonly` as restricted. Configure the OAuth consent screen and verification for the deployment and user audience. Thread bodies are fetched on demand, not copied into the CRM database. See [Gmail API scopes](https://developers.google.com/workspace/gmail/api/auth/scopes).
 
 ## Provider selection and credentials
 
@@ -55,6 +55,12 @@ The legacy Gmail message and thread IDs remain available alongside each message'
 
 Each provider advertises its own sending, inbound synchronization, webhook, bounce, delivery, open, and click capabilities. SES/Resend do not gain inbox synchronization merely because they send email. When Gmail is connected, the API can correlate a received message by matching sender, recipient, normalized subject, and time headers; the settings UI describes this as a best-effort capability.
 
+## Cal.com bookings
+
+Open **Meetings** in the frontend and follow the Cal.com connection instructions. Create a Cal.com webhook with the per-workspace subscriber URL shown there; select `BOOKING_CREATED`, `BOOKING_CANCELLED`, and `BOOKING_RESCHEDULED` (and optionally `BOOKING_REJECTED`). Use a unique webhook secret of at least 32 characters in Cal.com and save the same secret in the CRM. The API encrypts the secret at rest and verifies Cal.com's `X-Cal-Signature-256` HMAC against the raw request body.
+
+Cal.com must be able to reach the deployed API over public HTTPS. Booking records are stored in Supabase, associated to a CRM contact when attendee email matches, and shown on the Meetings page and dashboard. Link clicks are not used to infer bookings. Apply migration `005_cal_bookings.sql` before enabling the integration.
+
 ## Render deployment
 
 This API project has its own `render.yaml`. It pins Node 24.21.0 for deployment; `package.json` declares the supported Node range. Deploy it as a **Web Service** from the API project/repository root and configure the secret values in Render. Deploy the frontend's separate `render.yaml` as a **Static Site** from the frontend project/repository root. Set `FRONTEND_ORIGIN` and `PUBLIC_API_URL` to the deployed HTTPS URLs, and set the frontend's `VITE_API_URL` to the API URL ending in `/api`. Add the API callback URL to Google OAuth.
@@ -63,7 +69,7 @@ Supabase remains the authoritative CRM store. Do not use local files, Render fre
 
 The CRM sends a message synchronously when the user presses Send. It has no campaign scheduler or background worker; do not configure or advertise scheduled sends/follow-ups on the free tier. A message record is persisted before the provider request. If the request times out and acceptance is uncertain, the API leaves the message in `sending` and blocks the same idempotency key; check provider history before creating another attempt. Future scheduled campaigns need a durable database-backed queue and persistent worker before they are enabled.
 
-Apply database migrations manually through the Supabase SQL editor in sequence, after checking the migrations already applied. Migration 004 does not drop data. Store backups outside the API filesystem and document restoration steps for the selected Supabase plan.
+Apply database migrations manually through the Supabase SQL editor in sequence, after checking the migrations already applied. Migrations 004 and 005 do not drop data. Store backups outside the API filesystem and document restoration steps for the selected Supabase plan.
 
 ## Commands
 

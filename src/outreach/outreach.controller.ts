@@ -74,10 +74,34 @@ export class OutreachController {
     return this.outreachService.getMessages(request.user.id);
   }
 
+  @Get("messages/:id/thread")
+  @UseGuards(SupabaseAuthGuard)
+  getMessageThread(@Req() request: OutreachRequest, @Param("id") id: string) {
+    return this.outreachService.getMessageThread(request.user.id, id);
+  }
+
   @Get("stats")
   @UseGuards(SupabaseAuthGuard)
   getStats(@Req() request: OutreachRequest) {
     return this.outreachService.getStats(request.user.id);
+  }
+
+  @Get("calendar/bookings")
+  @UseGuards(SupabaseAuthGuard)
+  getCalendarMeetings(@Req() request: OutreachRequest) {
+    return this.outreachService.getMeetings(request.user.id);
+  }
+
+  @Get("calendar/settings")
+  @UseGuards(SupabaseAuthGuard)
+  getCalendarSettings(@Req() request: OutreachRequest) {
+    return this.outreachService.getCalendarSettings(request.user.id);
+  }
+
+  @Patch("calendar/settings")
+  @UseGuards(SupabaseAuthGuard)
+  saveCalendarSettings(@Req() request: OutreachRequest, @Body() body: unknown) {
+    return this.outreachService.saveCalendarWebhookSecret(request.user.id, body);
   }
 
   @Post("messages")
@@ -128,5 +152,14 @@ export class OutreachPublicController {
   @Post("webhooks/ses/:userId")
   async sesWebhook(@Param("userId") userId: string, @Req() request: { rawBody?: Buffer }) {
     return this.outreachService.processSesWebhook(userId, request.rawBody?.toString("utf8") || "");
+  }
+
+  @Post("calendar/webhook/:userId")
+  async calWebhook(
+    @Param("userId") userId: string,
+    @Req() request: { rawBody?: Buffer },
+    @Headers("x-cal-signature-256") signature: string,
+  ) {
+    return this.outreachService.processCalWebhook(userId, request.rawBody?.toString("utf8") || "", signature || "");
   }
 }
