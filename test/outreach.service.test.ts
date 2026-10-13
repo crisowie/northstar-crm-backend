@@ -3,7 +3,7 @@ import test from "node:test";
 import { createHmac, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { BadRequestException, ConflictException, ServiceUnavailableException, UnauthorizedException } from "@nestjs/common";
-import { emailProviders } from "../src/outreach/email-providers";
+import { emailProviders, GmailEmailProvider } from "../src/outreach/email-providers";
 import { OutreachService } from "../src/outreach/outreach.service";
 
 const userId = "00000000-0000-4000-8000-000000000123";
@@ -162,6 +162,90 @@ test("Gmail thread view strips HTML markup, angle brackets, and quoted replies f
   }
 });
 
+test("Gmail replies are sent into the original Gmail thread with reply headers", async () => {
+  const provider = new GmailEmailProvider();
+  const originalFetch = globalThis.fetch;
+  let requestBody: { raw?: string; threadId?: string } | undefined;
+  globalThis.fetch = async (_input, init) => {
+    requestBody = JSON.parse(String(init?.body)) as { raw?: string; threadId?: string };
+    return Response.json({ id: "gmail-reply-id", threadId: "gmail-thread-id" });
+  };
+  try {
+    const result = await provider.send({ senderEmail: "sender@example.test", accessToken: "token" }, {
+      id: "reply-row-id",
+      recipient: "jamie@example.test",
+      subject: "Re: Proposal",
+      html: "<div>Thanks!</div>",
+      senderName: "Taylor",
+      threadId: "gmail-thread-id",
+      inReplyTo: "<prior-message@example.test>",
+      references: "<first@example.test> <prior-message@example.test>",
+    });
+    const sentMime = Buffer.from(requestBody?.raw || "", "base64url").toString("utf8");
+    assert.equal(requestBody?.threadId, "gmail-thread-id");
+    assert.match(sentMime, /In-Reply-To: <prior-message@example\.test>/);
+    assert.match(sentMime, /References: <first@example\.test> <prior-message@example\.test>/);
+    assert.equal(result.providerThreadId, "gmail-thread-id");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("replying from an outreach conversation saves a new message under the original Gmail thread", async () => {
+  const { service, state } = createService();
+  const parentId = randomUUID();
+  const parent = {
+    id: parentId, idempotency_key: parentId, user_id: userId, contact_id: contact.id, opportunity_id: null,
+    recipient: contact.email, recipient_name: "Jamie Client", subject: "A proposal", body: "Original message",
+    status: "replied", sent_at: new Date(Date.now() - 60_000).toISOString(), replied_at: new Date().toISOString(),
+    gmail_message_id: "gmail-message-original", gmail_thread_id: "gmail-thread-original", provider: "gmail",
+    sender_account: "sender@example.test", provider_message_id: "gmail-message-original", provider_thread_id: "gmail-thread-original",
+    provider_capabilities: emailProviders.gmail.capabilities({ senderEmail: "sender@example.test" }),
+    recipient_opted_in: false, click_count: 0, created_at: new Date().toISOString(),
+  };
+  state.volatileMessages.set(userId, [parent]);
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    if (String(input).includes("/threads/gmail-thread-original?format=full")) {
+      return Response.json({ messages: [{
+        id: "gmail-message-original", internalDate: String(Date.now() - 60_000),
+        payload: { mimeType: "text/plain", headers: [
+          { name: "From", value: "sender@example.test" },
+          { name: "Message-ID", value: "<original@example.test>" },
+        ], body: { data: Buffer.from("Original message").toString("base64url") } },
+      }, {
+        id: "gmail-message-client-reply", internalDate: String(Date.now()),
+        payload: { mimeType: "text/plain", headers: [
+          { name: "From", value: "Jamie Client <jamie@example.test>" },
+          { name: "Message-ID", value: "<reply@example.test>" },
+          { name: "References", value: "<original@example.test>" },
+        ], body: { data: Buffer.from("Sounds good").toString("base64url") } },
+      }] });
+    }
+    assert.match(String(input), /\/messages\/send$/);
+    const payload = JSON.parse(String(init?.body)) as { raw: string; threadId: string };
+    const mime = Buffer.from(payload.raw, "base64url").toString("utf8");
+    assert.equal(payload.threadId, "gmail-thread-original");
+    assert.match(mime, /Subject: =\?UTF-8\?B\?UmU6IEEgcHJvcG9zYWw=\?=/);
+    assert.match(mime, /In-Reply-To: <reply@example\.test>/);
+    assert.match(mime, /References: <original@example\.test> <reply@example\.test>/);
+    return Response.json({ id: "gmail-message-followup", threadId: "gmail-thread-original" });
+  };
+  try {
+    const result = await service.sendReply(userId, parentId, {
+      body: "Thanks for your reply. When works for you?",
+      senderName: "Taylor",
+      idempotencyKey: randomUUID(),
+    });
+    assert.equal(result.subject, "Re: A proposal");
+    assert.equal(result.status, "sent");
+    assert.equal(result.gmailThreadUrl, "https://mail.google.com/mail/u/0/#all/gmail-thread-original");
+    assert.equal(state.volatileMessages.get(userId)?.length, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("outreach history loads every stored row across database pages", async () => {
   const { service } = createService();
   const ranges: Array<[number, number]> = [];
@@ -199,6 +283,8 @@ test("Groq workspace key is encrypted and can be connection-tested", async () =>
   globalThis.fetch = async (input, init) => {
     assert.equal(String(input), "https://api.groq.com/openai/v1/chat/completions");
     assert.equal((init?.headers as Record<string, string>).Authorization, "Bearer gsk-test-secret");
+    const request = JSON.parse(String(init?.body)) as { max_completion_tokens: number };
+    assert.equal(request.max_completion_tokens, 256);
     return Response.json({ choices: [{ message: { content: "OK" } }] });
   };
   try {

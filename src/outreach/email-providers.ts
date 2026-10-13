@@ -38,6 +38,9 @@ export type ProviderMessage = {
   html: string;
   senderName: string;
   replyTo?: string;
+  threadId?: string;
+  inReplyTo?: string;
+  references?: string;
 };
 
 export type ProviderSendResult = {
@@ -119,6 +122,8 @@ export class GmailEmailProvider implements EmailProviderAdapter {
       `To: <${message.recipient}>`,
       `Subject: =?UTF-8?B?${Buffer.from(message.subject, "utf8").toString("base64")}?=`,
       ...(message.replyTo ? [`Reply-To: <${message.replyTo}>`] : []),
+      ...(message.inReplyTo ? [`In-Reply-To: ${message.inReplyTo}`] : []),
+      ...(message.references ? [`References: ${message.references}`] : []),
       "MIME-Version: 1.0",
       "Content-Type: text/html; charset=UTF-8",
       "Content-Transfer-Encoding: base64",
@@ -128,7 +133,10 @@ export class GmailEmailProvider implements EmailProviderAdapter {
     const response = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/messages/send", {
       method: "POST",
       headers: { Authorization: `Bearer ${config.accessToken}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ raw: Buffer.from(rawMessage, "utf8").toString("base64url") }),
+      body: JSON.stringify({
+        raw: Buffer.from(rawMessage, "utf8").toString("base64url"),
+        ...(message.threadId ? { threadId: message.threadId } : {}),
+      }),
     });
     const sent = await response.json().catch(() => ({})) as { id?: string; threadId?: string; error?: { message?: string } };
     if (!response.ok || !sent.id || !sent.threadId) {

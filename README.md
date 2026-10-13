@@ -59,6 +59,8 @@ Draft requests send the prospect's name, role, country/region, linked company an
 
 The legacy Gmail message and thread IDs remain available alongside each message's internal ID, provider ID, sender account, and provider message/thread IDs. The normalized event table deduplicates provider webhooks. It distinguishes provider acceptance from delivery and records delivery only when the provider reports it. Open events are estimates; images may be blocked or cached. Clicks from tracked links are recorded by the CRM redirect. Historical click counters and URLs are preserved; there are no invented historical timestamps.
 
+Replies can be sent from the conversation view. Gmail replies use Gmail's existing thread ID and RFC reply headers; replies through SES or Resend are saved as part of the CRM conversation and sent with a `Re:` subject, but those providers do not expose Gmail-style thread identifiers.
+
 Each provider advertises its own sending, inbound synchronization, webhook, bounce, delivery, open, and click capabilities. SES/Resend do not gain inbox synchronization merely because they send email. When Gmail is connected, the API can correlate a received message by matching sender, recipient, normalized subject, and time headers; the settings UI describes this as a best-effort capability.
 
 ## Cal.com bookings

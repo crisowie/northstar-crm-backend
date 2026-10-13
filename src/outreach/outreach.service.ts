@@ -744,7 +744,9 @@ export class OutreachService {
       provider: row.provider || "gmail", senderAccount: row.sender_account || undefined,
       providerMessageId: row.provider_message_id || row.gmail_message_id || undefined,
       capabilities: row.provider_capabilities || emailProviders.gmail.capabilities({ senderEmail: row.sender_account || "" }),
-      gmailThreadUrl: (row.provider_thread_id || row.gmail_thread_id) ? `https://mail.google.com/mail/u/0/#all/${encodeURIComponent(row.provider_thread_id || row.gmail_thread_id || "")}` : undefined,
+      gmailThreadUrl: (row.provider_thread_id || row.gmail_thread_id) && !row.provider_thread_id?.startsWith("crm-thread:")
+        ? `https://mail.google.com/mail/u/0/#all/${encodeURIComponent(row.provider_thread_id || row.gmail_thread_id || "")}`
+        : undefined,
     };
   }
 
@@ -818,8 +820,30 @@ export class OutreachService {
   }
 
   async getMessageThread(userId: string, messageId: string) {
-    const row = (await this.getRows(userId)).find((message) => message.id === messageId);
+    const row = (await this.getAllMessageRows(userId)).find((message) => message.id === messageId);
     if (!row) throw new NotFoundException("This outreach message was not found.");
+    if (row.provider !== "gmail") {
+      const allRows = await this.getAllMessageRows(userId);
+      const rootId = row.provider_thread_id?.startsWith("crm-thread:")
+        ? row.provider_thread_id.slice("crm-thread:".length)
+        : row.id;
+      const rows = allRows
+        .filter((item) => item.id === rootId || item.provider_thread_id === `crm-thread:${rootId}`)
+        .sort((a, b) => (a.sent_at || "").localeCompare(b.sent_at || ""));
+      return {
+        threadId: `crm-thread:${rootId}`,
+        source: "crm",
+        messages: rows.map((item) => ({
+          id: item.provider_message_id || item.id,
+          from: item.sender_account || "",
+          to: item.recipient,
+          subject: item.subject,
+          sentAt: item.sent_at || item.created_at || "",
+          body: item.body,
+          direction: "sent" as const,
+        })),
+      };
+    }
     const sentMessage = {
       id: row.provider_message_id || row.id,
       from: row.sender_account || "",
@@ -859,12 +883,54 @@ export class OutreachService {
         from,
         to: header("To"),
         subject: header("Subject") || row.subject,
+        rfcMessageId: header("Message-ID"),
+        references: header("References"),
         sentAt: message.internalDate ? new Date(Number(message.internalDate)).toISOString() : "",
         body: message.payload ? this.gmailBody(message.payload) : "",
         direction: addressOf(from) === account.email_address.toLowerCase() ? "sent" as const : "received" as const,
       };
     }).filter((message) => message.id);
     return { threadId, source: "gmail", messages: messages.length ? messages : [sentMessage] };
+  }
+
+  async sendReply(userId: string, messageId: string, value: unknown) {
+    if (!isRecord(value) || typeof value.body !== "string" || !value.body.trim()) {
+      throw new BadRequestException("Enter a message before sending your reply.");
+    }
+    const parent = (await this.getAllMessageRows(userId)).find((item) => item.id === messageId);
+    if (!parent) throw new NotFoundException("This outreach conversation was not found.");
+    if (!["sent", "accepted", "delivered", "replied"].includes(parent.status)) {
+      throw new ConflictException("This email cannot be replied to because it was not successfully sent.");
+    }
+    const parentThreadId = parent.provider_thread_id || parent.gmail_thread_id;
+    let conversationId = parent.provider_thread_id?.startsWith("crm-thread:")
+      ? parent.provider_thread_id
+      : `crm-thread:${parent.id}`;
+    let threadId: string | undefined;
+    let inReplyTo: string | undefined;
+    let references: string | undefined;
+    if (parent.provider === "gmail" && parentThreadId) {
+      const thread = await this.getMessageThread(userId, parent.id) as {
+        threadId: string | null;
+        messages: Array<{ rfcMessageId?: string; references?: string }>;
+      };
+      threadId = thread.threadId || parentThreadId;
+      conversationId = threadId;
+      const latestMessage = thread.messages[thread.messages.length - 1];
+      inReplyTo = latestMessage?.rfcMessageId || undefined;
+      references = [latestMessage?.references, inReplyTo].filter(Boolean).join(" ") || undefined;
+    }
+    const subject = /^re:\s*/i.test(parent.subject) ? parent.subject : `Re: ${parent.subject}`;
+    return this.sendMessage(userId, {
+      contactId: parent.contact_id,
+      opportunityId: parent.opportunity_id || undefined,
+      subject,
+      body: value.body.trim(),
+      senderName: typeof value.senderName === "string" ? value.senderName : "",
+      provider: parent.provider,
+      recipientOptedIn: parent.recipient_opted_in,
+      idempotencyKey: value.idempotencyKey,
+    }, { threadId, inReplyTo, references, conversationId });
   }
 
   async getMeetings(userId: string) {
@@ -968,11 +1034,11 @@ export class OutreachService {
     return this.getGroqDraftSettings(userId);
   }
 
-  private async groqCompletion(apiKey: string, model: string, messages: Array<{ role: "system" | "user"; content: string }>, maxTokens = 800) {
+  private async groqCompletion(apiKey: string, model: string, messages: Array<{ role: "system" | "user"; content: string }>, maxTokens = 1200) {
     const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST",
       headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ model, messages, temperature: 0.6, max_tokens: maxTokens }),
+      body: JSON.stringify({ model, messages, temperature: 0.6, max_completion_tokens: maxTokens }),
     });
     if (!response.ok) {
       const payload = await response.json().catch(() => ({})) as { error?: { message?: string } };
@@ -988,8 +1054,8 @@ export class OutreachService {
     if (!settings.apiKey) throw new BadRequestException("Add a Groq API key in AI email drafting settings, or set GROQ_API_KEY on the API server.");
     const response = await this.groqCompletion(settings.apiKey, settings.model, [
       { role: "user", content: "Reply with the single word OK." },
-    ], 8);
-    if (!response) throw new ServiceUnavailableException("Groq returned an empty test response.");
+    ], 256);
+    if (!response) throw new ServiceUnavailableException("Groq accepted the request but returned no generated text. Check that the selected model supports chat completions, then try again.");
     const testedAt = new Date().toISOString();
     const updated: GroqSettingsRow = {
       user_id: userId,
@@ -1245,7 +1311,7 @@ export class OutreachService {
     }).map((line) => `<div>${line}</div>`).join("");
   }
 
-  async sendMessage(userId: string, value: unknown) {
+  async sendMessage(userId: string, value: unknown, threading?: { threadId?: string; inReplyTo?: string; references?: string; conversationId?: string }) {
     if (!isRecord(value) || typeof value.contactId !== "string" || typeof value.subject !== "string" || typeof value.body !== "string") throw new BadRequestException("Choose a contact and enter an email subject and message.");
     if (await this.isSendingPaused(userId)) throw new ConflictException("Outbound sending is paused for this workspace. Resume sending in Email Providers settings to continue.");
     const contactId = value.contactId.trim();
@@ -1315,6 +1381,9 @@ export class OutreachService {
       providerRequestStarted = true;
       const result = await emailProviders[selectedProvider].send(config, {
         id, recipient, subject, html: htmlBody, senderName,
+        ...(selectedProvider === "gmail" && threading?.threadId ? { threadId: threading.threadId } : {}),
+        ...(selectedProvider === "gmail" && threading?.inReplyTo ? { inReplyTo: threading.inReplyTo } : {}),
+        ...(selectedProvider === "gmail" && threading?.references ? { references: threading.references } : {}),
         ...(selectedProvider !== "gmail" && account?.email_address ? { replyTo: account.email_address } : {}),
       });
       acceptedByProvider = true;
@@ -1322,7 +1391,7 @@ export class OutreachService {
       row.status = selectedProvider === "gmail" ? "sent" : "accepted";
       row.sent_at = result.acceptedAt;
       row.provider_message_id = result.providerMessageId;
-      row.provider_thread_id = result.providerThreadId || null;
+      row.provider_thread_id = result.providerThreadId || (threading?.conversationId ? `crm-thread:${threading.conversationId.replace(/^crm-thread:/, "")}` : null);
       if (selectedProvider === "gmail") {
         row.gmail_message_id = result.providerMessageId;
         row.gmail_thread_id = result.providerThreadId || null;

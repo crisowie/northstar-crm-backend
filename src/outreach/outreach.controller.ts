@@ -134,6 +134,12 @@ export class OutreachController {
     return this.outreachService.sendMessage(request.user.id, body);
   }
 
+  @Post("messages/:id/reply")
+  @UseGuards(SupabaseAuthGuard)
+  sendReply(@Req() request: OutreachRequest, @Param("id") id: string, @Body() body: unknown) {
+    return this.outreachService.sendReply(request.user.id, id, body);
+  }
+
   @Post("sync")
   @UseGuards(SupabaseAuthGuard)
   syncReplies(@Req() request: OutreachRequest) {
