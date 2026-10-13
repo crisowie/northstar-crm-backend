@@ -80,6 +80,30 @@ export class OutreachController {
     return this.outreachService.getMessageThread(request.user.id, id);
   }
 
+  @Get("ai/settings")
+  @UseGuards(SupabaseAuthGuard)
+  getGroqDraftSettings(@Req() request: OutreachRequest) {
+    return this.outreachService.getGroqDraftSettings(request.user.id);
+  }
+
+  @Patch("ai/settings")
+  @UseGuards(SupabaseAuthGuard)
+  updateGroqDraftSettings(@Req() request: OutreachRequest, @Body() body: unknown) {
+    return this.outreachService.updateGroqDraftSettings(request.user.id, body);
+  }
+
+  @Post("ai/settings/test")
+  @UseGuards(SupabaseAuthGuard)
+  testGroqDraftSettings(@Req() request: OutreachRequest) {
+    return this.outreachService.testGroqDraftSettings(request.user.id);
+  }
+
+  @Post("ai/draft")
+  @UseGuards(SupabaseAuthGuard)
+  createAiOutreachDraft(@Req() request: OutreachRequest, @Body() body: unknown) {
+    return this.outreachService.createAiOutreachDraft(request.user.id, body);
+  }
+
   @Get("stats")
   @UseGuards(SupabaseAuthGuard)
   getStats(@Req() request: OutreachRequest) {

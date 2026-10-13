@@ -10,7 +10,7 @@ Copy-Item .env.example .env
 npm run start:dev
 ```
 
-The API listens on `http://localhost:5000/api`. Keep OAuth/API credentials in this API's environment only. Apply migrations `001_crm_workspaces.sql`, `002_crm_domain_tables.sql`, `003_gmail_outreach.sql`, `004_email_providers.sql`, and `005_cal_bookings.sql` in order if they have not already been applied. Migrations 004 and 005 are additive.
+The API listens on `http://localhost:5000/api`. Keep OAuth/API credentials in this API's environment only. Apply migrations `001_crm_workspaces.sql`, `002_crm_domain_tables.sql`, `003_gmail_outreach.sql`, `004_email_providers.sql`, `005_cal_bookings.sql`, and `006_groq_drafting.sql` in order if they have not already been applied. Migrations 004, 005, and 006 are additive.
 
 ## Gmail mailbox
 
@@ -48,6 +48,12 @@ For provider webhooks, create an SES configuration set with an SNS event destina
 ### Resend setup
 
 Set `RESEND_API_KEY`, `RESEND_FROM_EMAIL`, and optionally `RESEND_WEBHOOK_SECRET` in the API environment, or enter them in Email Providers settings. Verify the sender domain in Resend. Create a webhook pointed at the displayed workspace webhook URL and subscribe to `email.sent`, `email.delivered`, `email.bounced`, `email.complained`, `email.failed`, `email.opened`, and `email.clicked`. Copy its signing secret into settings. Webhooks use the original raw request body and Svix signature verification; duplicate event IDs are ignored.
+
+## AI email drafting
+
+Apply migration `006_groq_drafting.sql` before using Groq settings in the CRM. Configure either `GROQ_API_KEY` (and optionally `GROQ_MODEL`) in the API environment, or enter a Groq API key in the authenticated Settings → AI email drafting card. Workspace keys are encrypted using the existing `ENCRYPTION_KEY` and are never returned to the browser. Test the connection from Settings, then choose a contact in the Outreach composer and use **Draft with AI**. Generated subject and body are only inserted into the composer; a person must review and send them.
+
+Draft requests send the prospect's name, role, country/region, linked company and opportunity, preferred language, sender name, and user-provided brief to Groq. Contact email, phone, and internal notes are excluded.
 
 ## Email history and event semantics
 

@@ -31,6 +31,7 @@ function createService(values: Record<string, string> = {}) {
     volatileMessages: Map<string, Array<Record<string, unknown>>>;
     volatileCalendarSecrets: Map<string, string>;
     volatileMeetings: Map<string, Array<Record<string, unknown>>>;
+    volatileGroqSettings: Map<string, Record<string, unknown>>;
   };
   state.volatileAccounts.set(userId, {
     user_id: userId,
@@ -103,7 +104,7 @@ test("Gmail regression: reply sync reads Gmail metadata and correlates by sender
   }
 });
 
-test("Gmail thread view loads full message bodies only after read-only authorization", async () => {
+test("Gmail thread view strips HTML markup, angle brackets, and quoted replies from message bodies", async () => {
   const { service, state } = createService();
   const messageId = randomUUID();
   state.volatileMessages.set(userId, [{
@@ -129,22 +130,100 @@ test("Gmail thread view loads full message bodies only after read-only authoriza
     return Response.json({ messages: [{
       id: "reply-1", internalDate: String(Date.now()),
       payload: {
-        mimeType: "text/plain",
+        mimeType: "multipart/alternative",
         headers: [
           { name: "From", value: "Jamie Client <jamie@example.test>" },
           { name: "To", value: "sender@example.test" },
           { name: "Subject", value: "Re: A proposal" },
         ],
-        body: { data: Buffer.from("Thanks, let's talk.").toString("base64url") },
+        parts: [{
+          mimeType: "text/html",
+          body: { data: Buffer.from("<html><body><div>Hi &lt;Jamie&gt; &amp; team</div><p>Are you available tomorrow?</p><div class=\"gmail_quote\"><div>On Monday, Jamie wrote:</div><blockquote>Previous email content</blockquote></div><script>alert('ignored')</script></body></html>").toString("base64url") },
+        }],
+      },
+    }, {
+      id: "reply-2", internalDate: String(Date.now() + 1000),
+      payload: {
+        mimeType: "text/plain",
+        headers: [{ name: "From", value: "Jamie Client <jamie@example.test>" }],
+        body: { data: Buffer.from("That works for me.\n\nOn Monday, Taylor wrote:\n> Original email body").toString("base64url") },
       },
     }] });
   };
   try {
     const result = await service.getMessageThread(userId, messageId);
     assert.equal(result.source, "gmail");
-    assert.equal(result.messages.length, 1);
+    assert.equal(result.messages.length, 2);
     assert.equal(result.messages[0].direction, "received");
-    assert.equal(result.messages[0].body, "Thanks, let's talk.");
+    assert.equal(result.messages[0].body, "Hi Jamie & team\nAre you available tomorrow?");
+    assert.equal(result.messages[1].body, "That works for me.");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("outreach history loads every stored row across database pages", async () => {
+  const { service } = createService();
+  const ranges: Array<[number, number]> = [];
+  const rows = Array.from({ length: 1001 }, (_, index) => ({
+    id: `message-${index}`, user_id: userId, contact_id: contact.id, opportunity_id: null,
+    recipient: contact.email, recipient_name: "Jamie Client", subject: "A proposal", body: "Message",
+    status: "sent", sent_at: new Date(Date.now() - index * 1000).toISOString(), replied_at: null,
+    gmail_message_id: null, gmail_thread_id: null, provider: "gmail", sender_account: "sender@example.test",
+    provider_message_id: null, provider_thread_id: null, provider_capabilities: null,
+    idempotency_key: `key-${index}`, recipient_opted_in: false, click_count: 0, created_at: new Date().toISOString(),
+  }));
+  const query = {
+    select() { return this; },
+    eq() { return this; },
+    order() { return this; },
+    range(from: number, to: number) {
+      ranges.push([from, to]);
+      return Promise.resolve({ data: rows.slice(from, to + 1), error: null });
+    },
+  };
+  (service as unknown as { storage: unknown }).storage = { from: () => query };
+
+  const result = await service.getMessages(userId);
+  assert.equal(result.length, 1001);
+  assert.deepEqual(ranges, [[0, 999], [1000, 1999]]);
+});
+
+test("Groq workspace key is encrypted and can be connection-tested", async () => {
+  const { service, state } = createService();
+  const settings = await service.updateGroqDraftSettings(userId, { apiKey: "gsk-test-secret", model: "openai/gpt-oss-20b" });
+  assert.equal(settings.configured, true);
+  assert.equal(settings.keySource, "workspace");
+  assert.notEqual(state.volatileGroqSettings.get(userId)?.api_key_encrypted, "gsk-test-secret");
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    assert.equal(String(input), "https://api.groq.com/openai/v1/chat/completions");
+    assert.equal((init?.headers as Record<string, string>).Authorization, "Bearer gsk-test-secret");
+    return Response.json({ choices: [{ message: { content: "OK" } }] });
+  };
+  try {
+    const result = await service.testGroqDraftSettings(userId);
+    assert.equal(result.settings.lastTestedAt !== null, true);
+    assert.equal(result.result.model, "openai/gpt-oss-20b");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("Groq outreach draft uses workspace context without sending contact email or private notes", async () => {
+  const { service } = createService({ GROQ_API_KEY: "gsk-test-secret" });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_input, init) => {
+    const request = JSON.parse(String(init?.body)) as { messages: Array<{ content: string }> };
+    const prompt = request.messages.map((message) => message.content).join("\n");
+    assert.match(prompt, /Jamie/);
+    assert.match(prompt, /Client Co/);
+    assert.doesNotMatch(prompt, /jamie@example\.test/);
+    return Response.json({ choices: [{ message: { content: JSON.stringify({ subject: "A quick conversation", body: "Would you be available to talk?" }) } }] });
+  };
+  try {
+    const result = await service.createAiOutreachDraft(userId, { contactId: contact.id, senderName: "Taylor", language: "English" });
+    assert.deepEqual(result, { subject: "A quick conversation", body: "Would you be available to talk?", model: "openai/gpt-oss-20b" });
   } finally {
     globalThis.fetch = originalFetch;
   }

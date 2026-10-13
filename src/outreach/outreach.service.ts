@@ -83,9 +83,17 @@ type CalendarMeetingRow = {
   created_at: string;
   updated_at: string;
 };
+type GroqSettingsRow = {
+  user_id: string;
+  api_key_encrypted: string | null;
+  model: string;
+  last_tested_at: string | null;
+  last_error: string | null;
+};
 
 const providerIds: EmailProviderId[] = ["gmail", "ses", "resend"];
 const eventTypes = new Set(["queued", "sending", "sent", "provider_accepted", "delivered", "bounced", "complaint", "failed", "opened", "clicked", "reply_received", "unsubscribed"]);
+const outreachMessageColumns = "id,user_id,contact_id,opportunity_id,recipient,recipient_name,subject,body,status,sent_at,replied_at,gmail_message_id,gmail_thread_id,provider,sender_account,provider_message_id,provider_thread_id,provider_capabilities,idempotency_key,recipient_opted_in,click_count,created_at";
 
 function providerId(value: unknown): EmailProviderId {
   if (typeof value === "string" && providerIds.includes(value as EmailProviderId)) return value as EmailProviderId;
@@ -137,6 +145,7 @@ export class OutreachService {
   private readonly volatileEvents: StoredEmailEvent[] = [];
   private readonly volatileCalendarSecrets = new Map<string, string>();
   private readonly volatileMeetings = new Map<string, CalendarMeetingRow[]>();
+  private readonly volatileGroqSettings = new Map<string, GroqSettingsRow>();
 
   constructor(@Inject(ConfigService) private readonly config: ConfigService, @Inject(WorkspaceService) private readonly workspaceService: WorkspaceService) {
     const url = config.get<string>("SUPABASE_URL")?.trim();
@@ -618,9 +627,27 @@ export class OutreachService {
 
   private async getRows(userId: string): Promise<MessageRow[]> {
     if (!this.storage) return [...(this.volatileMessages.get(userId) || [])].sort((a, b) => (b.sent_at || "").localeCompare(a.sent_at || ""));
-    const { data, error } = await this.storage.from("crm_outreach_messages").select("id,user_id,contact_id,opportunity_id,recipient,recipient_name,subject,body,status,sent_at,replied_at,gmail_message_id,gmail_thread_id,provider,sender_account,provider_message_id,provider_thread_id,provider_capabilities,idempotency_key,recipient_opted_in,click_count,created_at").eq("user_id", userId).order("sent_at", { ascending: false, nullsFirst: false }).limit(1000);
+    const { data, error } = await this.storage.from("crm_outreach_messages").select(outreachMessageColumns).eq("user_id", userId).order("sent_at", { ascending: false, nullsFirst: false }).limit(1000);
     if (error) throw new ServiceUnavailableException("Could not load outreach messages.");
     return (data || []) as MessageRow[];
+  }
+
+  private async getAllMessageRows(userId: string): Promise<MessageRow[]> {
+    const storage = this.storage;
+    if (!storage) return this.getRows(userId);
+    const rows: MessageRow[] = [];
+    const pageSize = 1000;
+    for (let offset = 0; ; offset += pageSize) {
+      const { data, error } = await storage.from("crm_outreach_messages")
+        .select(outreachMessageColumns)
+        .eq("user_id", userId)
+        .order("sent_at", { ascending: false, nullsFirst: false })
+        .range(offset, offset + pageSize - 1);
+      if (error) throw new ServiceUnavailableException("Could not load outreach messages.");
+      const page = (data || []) as MessageRow[];
+      rows.push(...page);
+      if (page.length < pageSize) return rows;
+    }
   }
 
   private async saveMessage(row: MessageRow) {
@@ -722,35 +749,70 @@ export class OutreachService {
   }
 
   async getMessages(userId: string) {
-    return (await this.getRows(userId)).map((row) => this.toMessage(row));
+    return (await this.getAllMessageRows(userId)).map((row) => this.toMessage(row));
   }
 
   private decodeGmailBody(value: string) {
     return Buffer.from(value.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8");
   }
 
+  private htmlToText(value: string) {
+    const entities: Record<string, string> = {
+      amp: "&", apos: "'", gt: ">", lt: "<", nbsp: " ", quot: "\"",
+      ndash: "–", mdash: "—", rsquo: "’", lsquo: "‘", rdquo: "”", ldquo: "“",
+    };
+    return value
+      .replace(/<(script|style|head)\b[^>]*>[\s\S]*?<\/\1>/gi, "")
+      .replace(/<(?:blockquote|div)\b(?=[^>]*(?:class=["'][^"']*(?:gmail_quote|gmail_extra|yahoo_quoted)[^"']*["']|type=["']cite["']))[^>]*>[\s\S]*$/gi, "")
+      .replace(/<br\s*\/?>/gi, "\n")
+      .replace(/<\/(p|div|li|tr|h[1-6])\s*>/gi, "\n")
+      .replace(/<li\b[^>]*>/gi, "• ")
+      .replace(/<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi, "$2 ($1)")
+      .replace(/<[^>]*>/g, "")
+      .replace(/&#(x[0-9a-f]+|\d+);/gi, (entity, code: string) => {
+        const point = code[0].toLowerCase() === "x"
+          ? Number.parseInt(code.slice(1), 16)
+          : Number.parseInt(code, 10);
+        return Number.isInteger(point) && point > 0 && point <= 0x10ffff ? String.fromCodePoint(point) : entity;
+      })
+      .replace(/&([a-z]+);/gi, (entity, name: string) => entities[name.toLowerCase()] ?? entity)
+      .replace(/\r\n?/g, "\n")
+      .replace(/[ \t]+\n/g, "\n")
+      .replace(/\n[ \t]+/g, "\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+  }
+
+  private cleanGmailText(value: string) {
+    const quoteBoundary = /^\s*(?:On .{1,240}\bwrote:\s*|[-_]{2,}\s*Original Message\s*[-_]{2,}|Begin forwarded message:)\s*$/i;
+    const lines: string[] = [];
+    for (const line of value.replace(/\r\n?/g, "\n").split("\n")) {
+      if (quoteBoundary.test(line) || /^\s*>/.test(line)) break;
+      lines.push(line);
+    }
+    return lines.join("\n")
+      .replace(/<([^<>\n]+)>/g, "$1")
+      .replace(/[<>]/g, "")
+      .replace(/[ \t]+\n/g, "\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+  }
+
   private gmailBody(payload: Record<string, unknown>): string {
     const body = isRecord(payload.body) ? payload.body : {};
     const data = typeof body.data === "string" ? body.data : "";
     const mimeType = String(payload.mimeType || "");
-    if (mimeType === "text/plain" && data) return this.decodeGmailBody(data);
+    if (mimeType === "text/plain" && data) {
+      const text = this.decodeGmailBody(data);
+      return this.cleanGmailText(/<(?:html|body|div|p|br|table|span|a|ul|ol|blockquote)\b/i.test(text) ? this.htmlToText(text) : text);
+    }
     const parts = Array.isArray(payload.parts) ? payload.parts.filter(isRecord) : [];
     const plainParts = parts.filter((part) => part.mimeType === "text/plain");
     if (plainParts.length) return plainParts.map((part) => this.gmailBody(part)).filter(Boolean).join("\n").trim();
     const nested = parts.map((part) => this.gmailBody(part)).find(Boolean);
     if (nested) return nested;
     if (mimeType === "text/html" && data) {
-      return this.decodeGmailBody(data)
-        .replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1>/gi, "")
-        .replace(/<br\s*\/?>|<\/p>|<\/div>/gi, "\n")
-        .replace(/<[^>]*>/g, "")
-        .replace(/&nbsp;/gi, " ")
-        .replace(/&amp;/gi, "&")
-        .replace(/&lt;/gi, "<")
-        .replace(/&gt;/gi, ">")
-        .replace(/&quot;/gi, "\"")
-        .replace(/&#39;|&#x27;/gi, "'")
-        .trim();
+      return this.cleanGmailText(this.htmlToText(this.decodeGmailBody(data)));
     }
     return "";
   }
@@ -843,6 +905,141 @@ export class OutreachService {
       configured,
       webhookUrl: `${this.publicApiBase}/outreach/calendar/webhook/${encodeURIComponent(userId)}`,
     };
+  }
+
+  private async getGroqSettingsRow(userId: string): Promise<GroqSettingsRow | null> {
+    if (!this.storage) return this.volatileGroqSettings.get(userId) || null;
+    const { data, error } = await this.storage.from("crm_groq_settings")
+      .select("user_id,api_key_encrypted,model,last_tested_at,last_error")
+      .eq("user_id", userId).maybeSingle();
+    if (error) throw new ServiceUnavailableException("Could not load AI email settings.");
+    return data as GroqSettingsRow | null;
+  }
+
+  private async resolvedGroqConfig(userId: string) {
+    const row = await this.getGroqSettingsRow(userId);
+    const workspaceKey = row?.api_key_encrypted ? this.decrypt(row.api_key_encrypted) : "";
+    const environmentKey = this.config.get<string>("GROQ_API_KEY")?.trim() || "";
+    return {
+      row,
+      apiKey: workspaceKey || environmentKey,
+      keySource: workspaceKey ? "workspace" as const : environmentKey ? "environment" as const : "unconfigured" as const,
+      model: row?.model || this.config.get<string>("GROQ_MODEL")?.trim() || "openai/gpt-oss-20b",
+      hasWorkspaceKey: Boolean(workspaceKey),
+    };
+  }
+
+  async getGroqDraftSettings(userId: string) {
+    const settings = await this.resolvedGroqConfig(userId);
+    return {
+      configured: Boolean(settings.apiKey),
+      keySource: settings.keySource,
+      hasWorkspaceKey: settings.hasWorkspaceKey,
+      model: settings.model,
+      lastTestedAt: settings.row?.last_tested_at || null,
+      lastError: settings.row?.last_error || null,
+    };
+  }
+
+  async updateGroqDraftSettings(userId: string, value: unknown) {
+    if (!isRecord(value)) throw new BadRequestException("Enter a valid model and optional Groq API key.");
+    const current = await this.getGroqSettingsRow(userId);
+    const model = typeof value.model === "string" && value.model.trim()
+      ? value.model.trim().slice(0, 150)
+      : current?.model || this.config.get<string>("GROQ_MODEL")?.trim() || "openai/gpt-oss-20b";
+    if (!/^[a-zA-Z0-9._/-]+$/.test(model)) throw new BadRequestException("Enter a valid Groq model ID.");
+    const clearWorkspaceKey = value.clearWorkspaceKey === true;
+    const apiKey = typeof value.apiKey === "string" ? value.apiKey.trim() : "";
+    const encryptedKey = apiKey ? this.encrypt(apiKey) : clearWorkspaceKey ? null : current?.api_key_encrypted || null;
+    const configurationChanged = model !== current?.model
+      || Boolean(apiKey)
+      || (clearWorkspaceKey && Boolean(current?.api_key_encrypted));
+    const row: GroqSettingsRow = {
+      user_id: userId,
+      api_key_encrypted: encryptedKey,
+      model,
+      last_tested_at: configurationChanged ? null : current?.last_tested_at || null,
+      last_error: null,
+    };
+    if (this.storage) {
+      const { error } = await this.storage.from("crm_groq_settings").upsert(row, { onConflict: "user_id" });
+      if (error) throw new ServiceUnavailableException("Could not save AI email settings.");
+    } else this.volatileGroqSettings.set(userId, row);
+    return this.getGroqDraftSettings(userId);
+  }
+
+  private async groqCompletion(apiKey: string, model: string, messages: Array<{ role: "system" | "user"; content: string }>, maxTokens = 800) {
+    const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ model, messages, temperature: 0.6, max_tokens: maxTokens }),
+    });
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({})) as { error?: { message?: string } };
+      const detail = response.status === 401 ? "Groq rejected the API key." : response.status === 404 ? "The selected Groq model was not found." : "Groq could not generate a response.";
+      throw new ServiceUnavailableException(payload.error?.message ? `${detail} ${payload.error.message.slice(0, 240)}` : detail);
+    }
+    const payload = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
+    return payload.choices?.[0]?.message?.content?.trim() || "";
+  }
+
+  async testGroqDraftSettings(userId: string) {
+    const settings = await this.resolvedGroqConfig(userId);
+    if (!settings.apiKey) throw new BadRequestException("Add a Groq API key in AI email drafting settings, or set GROQ_API_KEY on the API server.");
+    const response = await this.groqCompletion(settings.apiKey, settings.model, [
+      { role: "user", content: "Reply with the single word OK." },
+    ], 8);
+    if (!response) throw new ServiceUnavailableException("Groq returned an empty test response.");
+    const testedAt = new Date().toISOString();
+    const updated: GroqSettingsRow = {
+      user_id: userId,
+      api_key_encrypted: settings.row?.api_key_encrypted || null,
+      model: settings.model,
+      last_tested_at: testedAt,
+      last_error: null,
+    };
+    if (this.storage) {
+      const { error } = await this.storage.from("crm_groq_settings").upsert(updated, { onConflict: "user_id" });
+      if (error) throw new ServiceUnavailableException("Groq tested successfully, but the test status could not be saved.");
+    } else this.volatileGroqSettings.set(userId, updated);
+    return { settings: await this.getGroqDraftSettings(userId), result: { model: settings.model } };
+  }
+
+  async createAiOutreachDraft(userId: string, value: unknown) {
+    if (!isRecord(value) || typeof value.contactId !== "string") throw new BadRequestException("Choose a contact before generating a draft.");
+    const settings = await this.resolvedGroqConfig(userId);
+    if (!settings.apiKey) throw new BadRequestException("Add a Groq API key in AI email drafting settings, or set GROQ_API_KEY on the API server.");
+    const workspace = await this.workspaceService.getWorkspace(userId);
+    const contact = workspace.data.contacts.find((item) => item.id === value.contactId && !item.archived);
+    if (!contact) throw new BadRequestException("Choose a contact from this workspace.");
+    const opportunity = typeof value.opportunityId === "string"
+      ? workspace.data.opportunities.find((item) => item.id === value.opportunityId && !item.archived)
+      : undefined;
+    if (value.opportunityId && !opportunity) throw new BadRequestException("Choose an opportunity from this workspace.");
+    const company = workspace.data.companies.find((item) => item.id === contact.companyId);
+    const language = typeof value.language === "string" && value.language.trim() ? value.language.trim().slice(0, 80) : "English";
+    const brief = typeof value.brief === "string" ? value.brief.trim().slice(0, 2000) : "";
+    const senderName = typeof value.senderName === "string" ? value.senderName.trim().slice(0, 100) : "";
+    const details = [
+      `Prospect first name: ${String(contact.firstName || "there")}`,
+      `Company: ${String(company?.name || "Not specified")}`,
+      `Role: ${String(contact.jobTitle || "Not specified")}`,
+      `Country or region: ${String(contact.country || "Not specified")}`,
+      `Opportunity: ${String(opportunity?.title || "Not specified")}`,
+      `Sender name: ${senderName || "Not specified"}`,
+      `Language: ${language}`,
+      `User brief: ${brief || "Write a concise, relevant introduction and ask for a short meeting."}`,
+    ].join("\n");
+    const content = await this.groqCompletion(settings.apiKey, settings.model, [
+      { role: "system", content: "Write a concise, natural, personalized first-contact business outreach email. Do not invent facts, make exaggerated claims, or include a subject inside the body. Return only valid JSON with exactly two string fields: subject and body." },
+      { role: "user", content: details },
+    ]);
+    let draft: unknown;
+    try { draft = JSON.parse(content.replace(/^```(?:json)?\s*|\s*```$/gi, "").trim()); } catch { throw new ServiceUnavailableException("Groq returned an invalid email draft. Try again or adjust the brief."); }
+    if (!isRecord(draft) || typeof draft.subject !== "string" || typeof draft.body !== "string" || !draft.subject.trim() || !draft.body.trim()) {
+      throw new ServiceUnavailableException("Groq returned an incomplete email draft. Try again.");
+    }
+    return { subject: draft.subject.trim().slice(0, 998), body: draft.body.trim().slice(0, 40000), model: settings.model };
   }
 
   async saveCalendarWebhookSecret(userId: string, value: unknown) {
