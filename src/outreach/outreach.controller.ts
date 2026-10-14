@@ -140,6 +140,12 @@ export class OutreachController {
     return this.outreachService.sendReply(request.user.id, id, body);
   }
 
+  @Post("messages/:id/ai-reply")
+  @UseGuards(SupabaseAuthGuard)
+  createAiReplyDraft(@Req() request: OutreachRequest, @Param("id") id: string, @Body() body: unknown) {
+    return this.outreachService.createAiReplyDraft(request.user.id, id, body);
+  }
+
   @Post("sync")
   @UseGuards(SupabaseAuthGuard)
   syncReplies(@Req() request: OutreachRequest) {

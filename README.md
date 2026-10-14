@@ -53,13 +53,13 @@ Set `RESEND_API_KEY`, `RESEND_FROM_EMAIL`, and optionally `RESEND_WEBHOOK_SECRET
 
 Apply migration `006_groq_drafting.sql` before using Groq settings in the CRM. Configure either `GROQ_API_KEY` (and optionally `GROQ_MODEL`) in the API environment, or enter a Groq API key in the authenticated Settings → AI email drafting card. Workspace keys are encrypted using the existing `ENCRYPTION_KEY` and are never returned to the browser. Test the connection from Settings, then choose a contact in the Outreach composer and use **Draft with AI**. Generated subject and body are only inserted into the composer; a person must review and send them.
 
-Draft requests send the prospect's name, role, country/region, linked company and opportunity, preferred language, sender name, and user-provided brief to Groq. Contact email, phone, and internal notes are excluded.
+First-contact draft requests send the prospect's name, role, country/region, linked company and opportunity, preferred language, sender name, and user-provided brief to Groq. Contact email, phone, and internal notes are excluded. The conversation **AI** reply action instead sends up to 12 recent message bodies and dates plus the contact's first name and linked company/opportunity context. It returns editable text only; a person must review and send it.
 
 ## Email history and event semantics
 
 The legacy Gmail message and thread IDs remain available alongside each message's internal ID, provider ID, sender account, and provider message/thread IDs. The normalized event table deduplicates provider webhooks. It distinguishes provider acceptance from delivery and records delivery only when the provider reports it. Open events are estimates; images may be blocked or cached. Clicks from tracked links are recorded by the CRM redirect. Historical click counters and URLs are preserved; there are no invented historical timestamps.
 
-Replies can be sent from the conversation view. Gmail replies use Gmail's existing thread ID and RFC reply headers; replies through SES or Resend are saved as part of the CRM conversation and sent with a `Re:` subject, but those providers do not expose Gmail-style thread identifiers.
+Replies can be sent from the conversation view. The frontend presents one conversation per contact while the API retains individual outbound message records for delivery, click, and reply analytics. The thread endpoint combines those messages with Gmail thread contents, including best-effort correlated Gmail replies to SES/Resend sends. Gmail replies use Gmail's existing thread ID and RFC reply headers; replies through SES or Resend are saved as part of the CRM conversation and sent with a `Re:` subject, but those providers do not expose Gmail-style thread identifiers.
 
 Each provider advertises its own sending, inbound synchronization, webhook, bounce, delivery, open, and click capabilities. SES/Resend do not gain inbox synchronization merely because they send email. When Gmail is connected, the API can correlate a received message by matching sender, recipient, normalized subject, and time headers; the settings UI describes this as a best-effort capability.
 

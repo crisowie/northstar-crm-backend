@@ -743,6 +743,7 @@ export class OutreachService {
       clickCount: row.click_count || 0,
       provider: row.provider || "gmail", senderAccount: row.sender_account || undefined,
       providerMessageId: row.provider_message_id || row.gmail_message_id || undefined,
+      providerThreadId: row.provider_thread_id || row.gmail_thread_id || undefined,
       capabilities: row.provider_capabilities || emailProviders.gmail.capabilities({ senderEmail: row.sender_account || "" }),
       gmailThreadUrl: (row.provider_thread_id || row.gmail_thread_id) && !row.provider_thread_id?.startsWith("crm-thread:")
         ? `https://mail.google.com/mail/u/0/#all/${encodeURIComponent(row.provider_thread_id || row.gmail_thread_id || "")}`
@@ -819,46 +820,9 @@ export class OutreachService {
     return "";
   }
 
-  async getMessageThread(userId: string, messageId: string) {
-    const row = (await this.getAllMessageRows(userId)).find((message) => message.id === messageId);
-    if (!row) throw new NotFoundException("This outreach message was not found.");
-    if (row.provider !== "gmail") {
-      const allRows = await this.getAllMessageRows(userId);
-      const rootId = row.provider_thread_id?.startsWith("crm-thread:")
-        ? row.provider_thread_id.slice("crm-thread:".length)
-        : row.id;
-      const rows = allRows
-        .filter((item) => item.id === rootId || item.provider_thread_id === `crm-thread:${rootId}`)
-        .sort((a, b) => (a.sent_at || "").localeCompare(b.sent_at || ""));
-      return {
-        threadId: `crm-thread:${rootId}`,
-        source: "crm",
-        messages: rows.map((item) => ({
-          id: item.provider_message_id || item.id,
-          from: item.sender_account || "",
-          to: item.recipient,
-          subject: item.subject,
-          sentAt: item.sent_at || item.created_at || "",
-          body: item.body,
-          direction: "sent" as const,
-        })),
-      };
-    }
-    const sentMessage = {
-      id: row.provider_message_id || row.id,
-      from: row.sender_account || "",
-      to: row.recipient,
-      subject: row.subject,
-      sentAt: row.sent_at || row.created_at || "",
-      body: row.body,
-      direction: "sent" as const,
-    };
+  private async readGmailThread(userId: string, row: MessageRow, threadId: string) {
     const account = await this.getStoredAccount(userId);
-    const threadId = row.provider_thread_id || row.gmail_thread_id;
-    if (!account || !threadId) {
-      return { threadId: threadId || null, source: "crm", messages: [sentMessage] };
-    }
-
+    if (!account) return null;
     const accessToken = await this.getAccessToken(userId);
     const url = new URL(`https://gmail.googleapis.com/gmail/v1/users/me/threads/${encodeURIComponent(threadId)}`);
     url.searchParams.set("format", "full");
@@ -887,10 +851,68 @@ export class OutreachService {
         references: header("References"),
         sentAt: message.internalDate ? new Date(Number(message.internalDate)).toISOString() : "",
         body: message.payload ? this.gmailBody(message.payload) : "",
+        providerThreadId: threadId,
         direction: addressOf(from) === account.email_address.toLowerCase() ? "sent" as const : "received" as const,
       };
     }).filter((message) => message.id);
-    return { threadId, source: "gmail", messages: messages.length ? messages : [sentMessage] };
+    return { threadId, messages };
+  }
+
+  async getMessageThread(userId: string, messageId: string) {
+    const allRows = await this.getAllMessageRows(userId);
+    const row = allRows.find((message) => message.id === messageId);
+    if (!row) throw new NotFoundException("This outreach message was not found.");
+    const rows = allRows.filter((item) => item.contact_id === row.contact_id)
+      .sort((a, b) => (a.sent_at || a.created_at || "").localeCompare(b.sent_at || b.created_at || ""));
+    const storedMessages = rows.map((item) => ({
+      id: item.provider_message_id || item.id,
+      from: item.sender_account || "",
+      to: item.recipient,
+      subject: item.subject,
+      sentAt: item.sent_at || item.created_at || "",
+      body: item.body,
+      providerThreadId: item.provider_thread_id?.startsWith("crm-thread:")
+        ? item.provider_thread_id
+        : item.provider_thread_id || item.gmail_thread_id || `crm-thread:${item.id}`,
+      direction: "sent" as const,
+    }));
+    const gmailThreadIds = [...new Set(rows.map((item) => item.provider === "gmail"
+      ? item.provider_thread_id || item.gmail_thread_id
+      : item.gmail_thread_id).filter((id): id is string => Boolean(id && !id.startsWith("crm-thread:"))))];
+    const account = await this.getStoredAccount(userId);
+    const gmailMessages: Array<{
+      id: string; from: string; to: string; subject: string; sentAt: string; body: string;
+      providerThreadId: string; direction: "sent" | "received"; rfcMessageId?: string; references?: string;
+    }> = [];
+    if (account && gmailThreadIds.length) {
+      for (let offset = 0; offset < gmailThreadIds.length; offset += 5) {
+        const batch = gmailThreadIds.slice(offset, offset + 5);
+        const threadResults = await Promise.all(batch.map((threadId) => {
+          const threadRow = rows.find((item) => item.provider_thread_id === threadId || item.gmail_thread_id === threadId) || row;
+          return this.readGmailThread(userId, threadRow, threadId);
+        }));
+        gmailMessages.push(...threadResults.flatMap((result) => result?.messages || []));
+      }
+    }
+    const messages = [...gmailMessages, ...storedMessages]
+      .filter((message, index, all) => all.findIndex((candidate) => candidate.id === message.id) === index)
+      .sort((a, b) => (a.sentAt || "").localeCompare(b.sentAt || ""));
+    const latestMessage = messages[messages.length - 1];
+    const targetThreadId = latestMessage?.providerThreadId || "";
+    const targetRows = targetThreadId.startsWith("crm-thread:")
+      ? rows.filter((item) => item.id === targetThreadId.slice("crm-thread:".length) || item.provider_thread_id === targetThreadId)
+      : rows.filter((item) => item.provider_thread_id === targetThreadId || item.gmail_thread_id === targetThreadId);
+    const replyTarget = (targetRows.length ? targetRows : rows).slice().sort((a, b) =>
+      (b.sent_at || b.created_at || "").localeCompare(a.sent_at || a.created_at || ""))[0];
+    const selectedThreadId = row.provider_thread_id?.startsWith("crm-thread:")
+      ? row.provider_thread_id
+      : row.provider_thread_id || row.gmail_thread_id || null;
+    return {
+      threadId: selectedThreadId,
+      source: gmailMessages.length ? "gmail" : "crm",
+      replyTargetId: replyTarget?.id || row.id,
+      messages,
+    };
   }
 
   async sendReply(userId: string, messageId: string, value: unknown) {
@@ -910,13 +932,10 @@ export class OutreachService {
     let inReplyTo: string | undefined;
     let references: string | undefined;
     if (parent.provider === "gmail" && parentThreadId) {
-      const thread = await this.getMessageThread(userId, parent.id) as {
-        threadId: string | null;
-        messages: Array<{ rfcMessageId?: string; references?: string }>;
-      };
-      threadId = thread.threadId || parentThreadId;
+      const thread = await this.readGmailThread(userId, parent, parentThreadId);
+      threadId = thread?.threadId || parentThreadId;
       conversationId = threadId;
-      const latestMessage = thread.messages[thread.messages.length - 1];
+      const latestMessage = thread?.messages[thread.messages.length - 1];
       inReplyTo = latestMessage?.rfcMessageId || undefined;
       references = [latestMessage?.references, inReplyTo].filter(Boolean).join(" ") || undefined;
     }
@@ -1106,6 +1125,62 @@ export class OutreachService {
       throw new ServiceUnavailableException("Groq returned an incomplete email draft. Try again.");
     }
     return { subject: draft.subject.trim().slice(0, 998), body: draft.body.trim().slice(0, 40000), model: settings.model };
+  }
+
+  async createAiReplyDraft(userId: string, messageId: string, value: unknown) {
+    const parent = (await this.getAllMessageRows(userId)).find((item) => item.id === messageId);
+    if (!parent) throw new NotFoundException("This outreach conversation was not found.");
+    if (!["sent", "accepted", "delivered", "replied"].includes(parent.status)) {
+      throw new ConflictException("An AI reply can only be drafted for a successfully sent conversation.");
+    }
+    const settings = await this.resolvedGroqConfig(userId);
+    if (!settings.apiKey) throw new BadRequestException("Add a Groq API key in AI email drafting settings, or set GROQ_API_KEY on the API server.");
+    const workspace = await this.workspaceService.getWorkspace(userId);
+    const contact = workspace.data.contacts.find((item) => item.id === parent.contact_id && !item.archived);
+    if (!contact) throw new NotFoundException("The contact for this conversation was not found.");
+    const opportunity = parent.opportunity_id
+      ? workspace.data.opportunities.find((item) => item.id === parent.opportunity_id && !item.archived)
+      : undefined;
+    const company = workspace.data.companies.find((item) => item.id === contact.companyId);
+    const thread = await this.getMessageThread(userId, messageId);
+    const recentMessages = thread.messages
+      .filter((item) => item.body.trim())
+      .slice(-12)
+      .map((item) => ({
+        direction: item.direction,
+        date: item.sentAt,
+        body: item.body.slice(0, 5000),
+      }));
+    if (!recentMessages.length) throw new BadRequestException("This conversation has no message content for AI to use.");
+    const instructions = isRecord(value) && typeof value.instructions === "string"
+      ? value.instructions.trim().slice(0, 2000)
+      : "";
+    const senderName = isRecord(value) && typeof value.senderName === "string"
+      ? value.senderName.trim().slice(0, 100)
+      : "";
+    const context = [
+      `Contact first name: ${String(contact.firstName || "there")}`,
+      `Company: ${String(company?.name || "Not specified")}`,
+      `Related opportunity: ${String(opportunity?.title || "Not specified")}`,
+      `Sender name: ${senderName || "Not specified"}`,
+      `Additional instructions: ${instructions || "Interpret the conversation and respond naturally to the latest message."}`,
+      `Recent conversation messages (oldest first):\n${JSON.stringify(recentMessages)}`,
+    ].join("\n");
+    const content = await this.groqCompletion(settings.apiKey, settings.model, [
+      {
+        role: "system",
+        content: "Draft a concise, natural email reply based on the conversation. Carefully interpret the latest received message and answer its questions or requests when possible. Preserve context from earlier messages, do not invent facts or claim actions that were not agreed, and do not include a subject or explanation. Return only valid JSON with exactly one string field: body.",
+      },
+      { role: "user", content: context },
+    ], 1200);
+    let draft: unknown;
+    try { draft = JSON.parse(content.replace(/^```(?:json)?\s*|\s*```$/gi, "").trim()); } catch {
+      throw new ServiceUnavailableException("Groq returned an invalid reply draft. Try again.");
+    }
+    if (!isRecord(draft) || typeof draft.body !== "string" || !draft.body.trim()) {
+      throw new ServiceUnavailableException("Groq returned an empty reply draft. Try again.");
+    }
+    return { body: draft.body.trim().slice(0, 40000), model: settings.model };
   }
 
   async saveCalendarWebhookSecret(userId: string, value: unknown) {

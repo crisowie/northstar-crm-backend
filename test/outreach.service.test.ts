@@ -153,10 +153,11 @@ test("Gmail thread view strips HTML markup, angle brackets, and quoted replies f
   try {
     const result = await service.getMessageThread(userId, messageId);
     assert.equal(result.source, "gmail");
-    assert.equal(result.messages.length, 2);
-    assert.equal(result.messages[0].direction, "received");
-    assert.equal(result.messages[0].body, "Hi Jamie & team\nAre you available tomorrow?");
-    assert.equal(result.messages[1].body, "That works for me.");
+    assert.equal(result.messages.length, 3);
+    assert.equal(result.messages.find((message) => message.id === "reply-1")?.direction, "received");
+    assert.equal(result.messages.find((message) => message.id === "reply-1")?.body, "Hi Jamie & team\nAre you available tomorrow?");
+    assert.equal(result.messages.find((message) => message.id === "reply-2")?.body, "That works for me.");
+    assert.ok(result.messages.some((message) => message.id === "gmail-message-thread" && message.direction === "sent"));
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -246,6 +247,106 @@ test("replying from an outreach conversation saves a new message under the origi
   }
 });
 
+test("non-Gmail conversation includes a correlated Gmail inbox reply", async () => {
+  const { service, state } = createService();
+  const rootId = randomUUID();
+  const sentAt = new Date(Date.now() - 60_000).toISOString();
+  state.volatileMessages.set(userId, [{
+    id: rootId, idempotency_key: rootId, user_id: userId, contact_id: contact.id, opportunity_id: null,
+    recipient: contact.email, recipient_name: "Jamie Client", subject: "A proposal", body: "Initial message",
+    status: "replied", sent_at: sentAt, replied_at: new Date().toISOString(),
+    gmail_message_id: null, gmail_thread_id: "gmail-inbound-thread", provider: "ses",
+    sender_account: "sender@example.test", provider_message_id: "ses-message-1", provider_thread_id: null,
+    provider_capabilities: emailProviders.ses.capabilities({ senderEmail: "sender@example.test" }),
+    recipient_opted_in: false, click_count: 0, created_at: sentAt,
+  }, {
+    id: randomUUID(), idempotency_key: randomUUID(), user_id: userId, contact_id: contact.id, opportunity_id: null,
+    recipient: contact.email, recipient_name: "Jamie Client", subject: "Re: A proposal", body: "Thanks for getting back to me.",
+    status: "accepted", sent_at: new Date(Date.now() + 10_000).toISOString(), replied_at: null,
+    gmail_message_id: null, gmail_thread_id: null, provider: "ses",
+    sender_account: "sender@example.test", provider_message_id: "ses-message-2", provider_thread_id: `crm-thread:${rootId}`,
+    provider_capabilities: emailProviders.ses.capabilities({ senderEmail: "sender@example.test" }),
+    recipient_opted_in: false, click_count: 0, created_at: new Date().toISOString(),
+  }]);
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    assert.match(String(input), /threads\/gmail-inbound-thread\?format=full/);
+    return Response.json({ messages: [{
+      id: "gmail-inbound-reply", internalDate: String(Date.now()),
+      payload: {
+        mimeType: "text/plain",
+        headers: [
+          { name: "From", value: "Jamie Client <jamie@example.test>" },
+          { name: "To", value: "sender@example.test" },
+          { name: "Subject", value: "Re: A proposal" },
+        ],
+        body: { data: Buffer.from("Can you send the revised proposal?").toString("base64url") },
+      },
+    }] });
+  };
+  try {
+    const thread = await service.getMessageThread(userId, rootId);
+    assert.equal(thread.source, "gmail");
+    assert.equal(thread.threadId, "gmail-inbound-thread");
+    assert.equal(thread.messages.length, 3);
+    assert.equal(thread.messages.find((message) => message.id === "gmail-inbound-reply")?.direction, "received");
+    assert.equal(thread.messages.find((message) => message.id === "gmail-inbound-reply")?.body, "Can you send the revised proposal?");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("conversation history combines separate email threads for the same contact", async () => {
+  const { service, state } = createService();
+  const olderId = randomUUID();
+  const latestId = randomUUID();
+  const olderSentAt = new Date(Date.now() - 120_000).toISOString();
+  const latestSentAt = new Date(Date.now() - 60_000).toISOString();
+  const row = (id: string, threadId: string, sentAt: string, subject: string) => ({
+    id, idempotency_key: id, user_id: userId, contact_id: contact.id, opportunity_id: null,
+    recipient: contact.email, recipient_name: "Jamie Client", subject, body: `Sent ${subject}`,
+    status: "sent", sent_at: sentAt, replied_at: null,
+    gmail_message_id: `sent-${threadId}`, gmail_thread_id: threadId, provider: "gmail",
+    sender_account: "sender@example.test", provider_message_id: `sent-${threadId}`, provider_thread_id: threadId,
+    provider_capabilities: emailProviders.gmail.capabilities({ senderEmail: "sender@example.test" }),
+    recipient_opted_in: false, click_count: 0, created_at: sentAt,
+  });
+  state.volatileMessages.set(userId, [
+    row(olderId, "gmail-old-thread", olderSentAt, "First proposal"),
+    row(latestId, "gmail-new-thread", latestSentAt, "Updated proposal"),
+  ]);
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    const threadId = url.includes("gmail-old-thread") ? "gmail-old-thread" : "gmail-new-thread";
+    return Response.json({ messages: [{
+      id: `received-${threadId}`, internalDate: String(Date.parse(latestSentAt) + 10_000),
+      payload: {
+        mimeType: "text/plain",
+        headers: [
+          { name: "From", value: "Jamie Client <jamie@example.test>" },
+          { name: "To", value: "sender@example.test" },
+          { name: "Subject", value: "Re: proposal" },
+        ],
+        body: { data: Buffer.from(`Reply in ${threadId}`).toString("base64url") },
+      },
+    }] });
+  };
+  try {
+    const thread = await service.getMessageThread(userId, olderId);
+    assert.equal(thread.messages.length, 4);
+    assert.deepEqual(thread.messages.map((item) => item.id), [
+      "sent-gmail-old-thread",
+      "sent-gmail-new-thread",
+      "received-gmail-old-thread",
+      "received-gmail-new-thread",
+    ]);
+    assert.equal(thread.replyTargetId, latestId);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("outreach history loads every stored row across database pages", async () => {
   const { service } = createService();
   const ranges: Array<[number, number]> = [];
@@ -310,6 +411,48 @@ test("Groq outreach draft uses workspace context without sending contact email o
   try {
     const result = await service.createAiOutreachDraft(userId, { contactId: contact.id, senderName: "Taylor", language: "English" });
     assert.deepEqual(result, { subject: "A quick conversation", body: "Would you be available to talk?", model: "openai/gpt-oss-20b" });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("AI conversation reply draft interprets recent received messages and returns editable text", async () => {
+  const { service, state } = createService({ GROQ_API_KEY: "gsk-test-secret" });
+  const messageId = randomUUID();
+  state.volatileMessages.set(userId, [{
+    id: messageId, idempotency_key: messageId, user_id: userId, contact_id: contact.id, opportunity_id: null,
+    recipient: contact.email, recipient_name: "Jamie Client", subject: "A proposal", body: "Here is our proposal.",
+    status: "replied", sent_at: new Date(Date.now() - 60_000).toISOString(), replied_at: new Date().toISOString(),
+    gmail_message_id: "gmail-ai-sent", gmail_thread_id: "gmail-ai-thread", provider: "gmail",
+    sender_account: "sender@example.test", provider_message_id: "gmail-ai-sent", provider_thread_id: "gmail-ai-thread",
+    provider_capabilities: emailProviders.gmail.capabilities({ senderEmail: "sender@example.test" }),
+    recipient_opted_in: false, click_count: 0, created_at: new Date().toISOString(),
+  }]);
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    if (String(input).includes("/threads/gmail-ai-thread")) {
+      return Response.json({ messages: [{
+        id: "gmail-ai-received", internalDate: String(Date.now()),
+        payload: {
+          mimeType: "text/plain",
+          headers: [
+            { name: "From", value: "Jamie Client <jamie@example.test>" },
+            { name: "To", value: "sender@example.test" },
+            { name: "Subject", value: "Re: A proposal" },
+          ],
+          body: { data: Buffer.from("Could you send the revised proposal by Friday?").toString("base64url") },
+        },
+      }] });
+    }
+    assert.equal(String(input), "https://api.groq.com/openai/v1/chat/completions");
+    const request = JSON.parse(String(init?.body)) as { messages: Array<{ content: string }> };
+    assert.match(request.messages[1].content, /Could you send the revised proposal by Friday\?/);
+    assert.doesNotMatch(request.messages[1].content, /jamie@example\.test/);
+    return Response.json({ choices: [{ message: { content: JSON.stringify({ body: "Yes, I’ll send the revised proposal by Friday." }) } }] });
+  };
+  try {
+    const result = await service.createAiReplyDraft(userId, messageId, { senderName: "Taylor" });
+    assert.deepEqual(result, { body: "Yes, I’ll send the revised proposal by Friday.", model: "openai/gpt-oss-20b" });
   } finally {
     globalThis.fetch = originalFetch;
   }
