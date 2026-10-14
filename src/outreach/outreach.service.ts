@@ -1419,8 +1419,14 @@ export class OutreachService {
     const subject = mergeFields(value.subject.trim(), fields).trim();
     const renderedBody = mergeFields(value.body, fields).trim();
     const id = idempotencyKey;
+    const existingRows = await this.getAllMessageRows(userId);
+    const existingRequest = existingRows.find((row) => row.idempotency_key === id);
+    if (!threading && !existingRequest && existingRows.some((row) => row.contact_id === contactId
+      && (row.status !== "failed" || Boolean(row.sent_at)))) {
+      throw new ConflictException("This contact already has an outreach conversation. Open that conversation to continue the chat.");
+    }
     const duplicateCheckSince = Date.now() - 60 * 60 * 1000;
-    const unresolvedDuplicate = (await this.getRows(userId)).find((row) => row.id !== id
+    const unresolvedDuplicate = existingRows.find((row) => row.id !== id
       && row.status === "sending" && row.recipient.toLowerCase() === recipient.toLowerCase()
       && row.subject === subject && row.body === renderedBody
       && new Date(row.created_at || 0).getTime() >= duplicateCheckSince);

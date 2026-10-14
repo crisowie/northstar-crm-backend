@@ -74,6 +74,26 @@ test("Gmail regression: an accepted Gmail send is stored with legacy and provide
   }
 });
 
+test("new outreach is blocked for a contact with a previous successful send", async () => {
+  const { service } = createService();
+  const originalSend = emailProviders.gmail.send;
+  let sends = 0;
+  emailProviders.gmail.send = async () => {
+    sends += 1;
+    return { providerMessageId: "gmail-message-existing-contact", providerThreadId: "gmail-thread-existing-contact", acceptedAt: new Date().toISOString() };
+  };
+  try {
+    await service.sendMessage(userId, sendInput(randomUUID()));
+    await assert.rejects(
+      service.sendMessage(userId, sendInput(randomUUID())),
+      (error: unknown) => error instanceof ConflictException && /already has an outreach conversation/.test(error.message),
+    );
+    assert.equal(sends, 1);
+  } finally {
+    emailProviders.gmail.send = originalSend;
+  }
+});
+
 test("Gmail regression: reply sync reads Gmail metadata and correlates by sender/time without message bodies", async () => {
   const { service, state } = createService();
   const row = {
