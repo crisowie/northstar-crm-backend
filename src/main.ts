@@ -1,10 +1,12 @@
 import "reflect-metadata";
 import { ConfigService } from "@nestjs/config";
 import { NestFactory } from "@nestjs/core";
+import { NestExpressApplication } from "@nestjs/platform-express";
 import { AppModule } from "./app.module";
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule, { rawBody: true });
+  const app = await NestFactory.create<NestExpressApplication>(AppModule, { rawBody: true });
+  app.useBodyParser("json", { limit: "10mb" });
   const config = app.get(ConfigService);
   const environment = config.get<string>("NODE_ENV") || process.env.NODE_ENV || "development";
   const defaultProvider = (config.get<string>("EMAIL_PROVIDER") || "gmail").trim().toLowerCase();
