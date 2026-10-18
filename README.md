@@ -10,7 +10,7 @@ Copy-Item .env.example .env
 npm run start:dev
 ```
 
-The API listens on `http://localhost:5000/api`. Keep OAuth/API credentials in this API's environment only. Apply migrations `001_crm_workspaces.sql`, `002_crm_domain_tables.sql`, `003_gmail_outreach.sql`, `004_email_providers.sql`, `005_cal_bookings.sql`, and `006_groq_drafting.sql` in order if they have not already been applied. Migrations 004, 005, and 006 are additive.
+The API listens on `http://localhost:5000/api`. Keep OAuth/API credentials in this API's environment only. Apply migrations `001_crm_workspaces.sql` through `007_preserve_workspace_records.sql` in order if they have not already been applied. Migrations 004, 005, 006, and 007 are additive; migration 007 changes workspace saves to merge records by ID rather than delete rows omitted from a client snapshot.
 
 ## Gmail mailbox
 
@@ -77,7 +77,7 @@ Supabase remains the authoritative CRM store. Do not use local files, Render fre
 
 The CRM sends a message synchronously when the user presses Send. It has no campaign scheduler or background worker; do not configure or advertise scheduled sends/follow-ups on the free tier. A message record is persisted before the provider request. If the request times out and acceptance is uncertain, the API leaves the message in `sending` and blocks the same idempotency key; check provider history before creating another attempt. Future scheduled campaigns need a durable database-backed queue and persistent worker before they are enabled.
 
-Apply database migrations manually through the Supabase SQL editor in sequence, after checking the migrations already applied. Migrations 004 and 005 do not drop data. Store backups outside the API filesystem and document restoration steps for the selected Supabase plan.
+Apply database migrations manually through the Supabase SQL editor in sequence, after checking the migrations already applied. Migrations 004, 005, 006, and 007 do not drop data. Store backups outside the API filesystem and document restoration steps for the selected Supabase plan.
 
 ## Commands
 

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { readFileSync } from "node:fs";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { WorkspaceService } from "../src/workspace/workspace.service";
 
@@ -39,4 +40,14 @@ test("loads every workspace row when Supabase caps each response page", async ()
 
   assert.equal(data.contacts.length, 270);
   assert.equal(data.contacts[269].id, "contact-269");
+});
+
+test("workspace save migration never deletes records omitted from a client snapshot", () => {
+  const migration = readFileSync(
+    new URL("../supabase/migrations/007_preserve_workspace_records.sql", import.meta.url),
+    "utf8",
+  );
+
+  assert.doesNotMatch(migration, /delete\s+from\s+public\.crm_/i);
+  assert.equal((migration.match(/on conflict \(user_id, id\) do update set/gi) || []).length, 7);
 });
