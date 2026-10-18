@@ -37,6 +37,7 @@ const entityTables = [
   ["notes", "crm_notes"],
   ["activities", "crm_activities"],
 ] as const;
+const workspacePageSize = 1000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -97,11 +98,24 @@ export class WorkspaceService {
         .select("organization,pipeline_stages,job_statuses")
         .eq("user_id", userId)
         .maybeSingle(),
-      ...entityTables.map(([, table]) => this.storageClient!
-        .from(table)
-        .select("payload")
-        .eq("user_id", userId)
-        .order("position", { ascending: true })),
+      ...entityTables.map(async ([, table]) => {
+        const rows: { payload: Record<string, unknown> }[] = [];
+        let offset = 0;
+        while (true) {
+          const result = await this.storageClient!
+            .from(table)
+            .select("payload")
+            .eq("user_id", userId)
+            .order("position", { ascending: true })
+            .order("id", { ascending: true })
+            .range(offset, offset + workspacePageSize - 1);
+          if (result.error) return { data: null, error: result.error };
+          const page = result.data || [];
+          if (page.length === 0) return { data: rows, error: null };
+          rows.push(...page);
+          offset += page.length;
+        }
+      }),
     ]);
 
     if (settingsResult.error || entityResults.some((result) => result.error)) {
