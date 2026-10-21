@@ -12,7 +12,7 @@ npm run start:dev
 
 The API listens on `http://localhost:5000/api`. Keep OAuth/API credentials in this API's environment only. Apply migrations `001_crm_workspaces.sql` through `007_preserve_workspace_records.sql` in order if they have not already been applied. Migrations 004, 005, 006, and 007 are additive; migration 007 changes workspace saves to merge records by ID rather than delete rows omitted from a client snapshot.
 
-Telnyx browser calling setup, the additive migration 008, Railway environment variables, portal configuration, and the live-call checklist are documented in [docs/telnyx-voice-calling.md](docs/telnyx-voice-calling.md). Calling stays disabled until server configuration is complete and `TELNYX_PARK_OUTBOUND_CALLS=true` is explicitly set.
+Telnyx browser calling setup, additive migrations 008 and 009, Railway environment variables, portal configuration, and the live-call checklist are documented in [docs/telnyx-voice-calling.md](docs/telnyx-voice-calling.md). Calling stays disabled until server configuration is complete and `TELNYX_PARK_OUTBOUND_CALLS=true` is explicitly set.
 
 ## Gmail mailbox
 

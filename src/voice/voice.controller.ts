@@ -22,7 +22,7 @@ export class VoiceController {
   authorizeCall(@Req() request: AuthenticatedRequest, @Body() body: unknown) { return this.voice.authorizeCall(request.user.id, body); }
 
   @Get("calls")
-  listCalls(@Req() request: AuthenticatedRequest, @Query("contactId") contactId?: string) { return this.voice.listCalls(request.user.id, contactId); }
+  listCalls(@Req() request: AuthenticatedRequest, @Query("contactId") contactId?: string, @Query("companyId") companyId?: string) { return this.voice.listCalls(request.user.id, contactId, companyId); }
 
   @Get("calls/:id")
   getCall(@Req() request: AuthenticatedRequest, @Param("id") id: string) { return this.voice.getCallStatus(request.user.id, id); }

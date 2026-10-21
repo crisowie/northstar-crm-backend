@@ -18,7 +18,7 @@ const activeStatuses = ["authorized", "connecting", "dialing", "connected", "end
 const outcomes = ["No answer", "Busy", "Voicemail", "Connected — interested", "Connected — follow-up required", "Not interested", "Wrong number", "Other"] as const;
 type VoiceStatus = "authorized" | "connecting" | "dialing" | "connected" | "ending" | "ended" | "failed" | "cancelled";
 type VoiceCall = {
-  id: string; userId: string; sessionId: string; contactId: string | null; idempotencyKey: string;
+  id: string; userId: string; sessionId: string; contactId: string | null; companyId: string | null; idempotencyKey: string;
   destination: string; callerNumber: string; provider: "telnyx"; status: VoiceStatus;
   webrtcCallControlId: string | null; pstnCallControlId: string | null;
   startedAt: string; answeredAt: string | null; endedAt: string | null; durationSeconds: number | null;
@@ -28,7 +28,7 @@ type VoiceCall = {
 
 function rowToCall(row: Record<string, any>): VoiceCall {
   return {
-    id: row.id, userId: row.user_id, sessionId: row.session_id, contactId: row.contact_id || null,
+    id: row.id, userId: row.user_id, sessionId: row.session_id, contactId: row.contact_id || null, companyId: row.company_id || null,
     idempotencyKey: row.idempotency_key, destination: row.destination, callerNumber: row.caller_number,
     provider: "telnyx", status: row.status, webrtcCallControlId: row.webrtc_call_control_id || null,
     pstnCallControlId: row.pstn_call_control_id || null, startedAt: row.started_at,
@@ -42,7 +42,7 @@ function rowToCall(row: Record<string, any>): VoiceCall {
 
 function callToRow(call: VoiceCall) {
   return {
-    id: call.id, user_id: call.userId, session_id: call.sessionId, contact_id: call.contactId,
+    id: call.id, user_id: call.userId, session_id: call.sessionId, contact_id: call.contactId, company_id: call.companyId,
     idempotency_key: call.idempotencyKey, destination: call.destination, caller_number: call.callerNumber,
     provider: call.provider, status: call.status, webrtc_call_control_id: call.webrtcCallControlId,
     pstn_call_control_id: call.pstnCallControlId, started_at: call.startedAt, answered_at: call.answeredAt,
@@ -92,7 +92,7 @@ function correlationId(payload: Record<string, unknown>): string | null {
 
 function safeCall(call: VoiceCall) {
   return {
-    id: call.id, contactId: call.contactId, destination: call.destination, callerId: call.callerNumber,
+    id: call.id, contactId: call.contactId, companyId: call.companyId, destination: call.destination, callerId: call.callerNumber,
     provider: call.provider, status: call.status, startedAt: call.startedAt, answeredAt: call.answeredAt,
     endedAt: call.endedAt, durationSeconds: call.durationSeconds, failureReason: call.failureReason,
     outcome: call.outcome, note: call.note, followUpDate: call.followUpDate,
@@ -221,9 +221,13 @@ export class VoiceService {
     if (!/^[a-zA-Z0-9_-]{12,100}$/.test(idempotencyKey)) throw new BadRequestException("A valid idempotency key is required.");
     const contactId = typeof input.contactId === "string" && input.contactId.length <= 120 ? input.contactId.trim() || null : null;
     if (input.contactId !== undefined && input.contactId !== null && typeof input.contactId !== "string") throw new BadRequestException("Contact ID must be text.");
-    if (contactId) {
+    const companyId = typeof input.companyId === "string" && input.companyId.length <= 120 ? input.companyId.trim() || null : null;
+    if (input.companyId !== undefined && input.companyId !== null && typeof input.companyId !== "string") throw new BadRequestException("Company ID must be text.");
+    if (contactId && companyId) throw new BadRequestException("Link a call to either a contact or a company, not both.");
+    if (contactId || companyId) {
       const { data } = await this.workspace.getWorkspace(userId);
-      if (!data.contacts.some((contact) => contact.id === contactId)) throw new NotFoundException("The selected contact was not found in your workspace.");
+      if (contactId && !data.contacts.some((contact) => contact.id === contactId)) throw new NotFoundException("The selected contact was not found in your workspace.");
+      if (companyId && !data.companies.some((company) => company.id === companyId)) throw new NotFoundException("The selected company was not found in your workspace.");
     }
     if (this.storage) {
       const duplicate = await this.storage.from("crm_voice_calls").select("*").eq("user_id", userId).eq("idempotency_key", idempotencyKey).maybeSingle();
@@ -240,7 +244,7 @@ export class VoiceService {
     await this.enforceRateLimit(userId, "call");
     const now = new Date().toISOString();
     const call: VoiceCall = {
-      id: randomUUID(), userId, sessionId: session.id, contactId, idempotencyKey,
+      id: randomUUID(), userId, sessionId: session.id, contactId, companyId, idempotencyKey,
       destination: target.e164, callerNumber: callerId, provider: "telnyx", status: "authorized",
       webrtcCallControlId: null, pstnCallControlId: null, startedAt: now, answeredAt: null,
       endedAt: null, durationSeconds: null, failureReason: null, outcome: null, note: null,
@@ -292,16 +296,19 @@ export class VoiceService {
     return { call: safeCall(call) };
   }
 
-  async listCalls(userId: string, contactId?: string) {
+  async listCalls(userId: string, contactId?: string, companyId?: string) {
     if (contactId !== undefined && (typeof contactId !== "string" || contactId.length > 120)) throw new BadRequestException("Contact ID is invalid.");
+    if (companyId !== undefined && (typeof companyId !== "string" || companyId.length > 120)) throw new BadRequestException("Company ID is invalid.");
+    if (contactId && companyId) throw new BadRequestException("Filter by either a contact or a company, not both.");
     if (this.storage) {
       let query = this.storage.from("crm_voice_calls").select("*").eq("user_id", userId).order("created_at", { ascending: false }).limit(100);
       if (contactId) query = query.eq("contact_id", contactId);
+      if (companyId) query = query.eq("company_id", companyId);
       const result = await query;
       if (result.error) throw new ServiceUnavailableException("Call history could not be loaded.");
       return { calls: (result.data || []).map((row) => safeCall(rowToCall(row))) };
     }
-    return { calls: [...this.calls.values()].filter((call) => call.userId === userId && (!contactId || call.contactId === contactId)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 100).map(safeCall) };
+    return { calls: [...this.calls.values()].filter((call) => call.userId === userId && (!contactId || call.contactId === contactId) && (!companyId || call.companyId === companyId)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 100).map(safeCall) };
   }
 
   async getCallStatus(userId: string, id: string) {
@@ -324,31 +331,33 @@ export class VoiceService {
     call.outcome = input.outcome;
     call.note = note.trim() || null;
     call.followUpDate = date as string | null;
-    call.followUpTaskId = call.contactId && call.followUpDate ? `voice-follow-up-${call.id}` : null;
+    call.followUpTaskId = (call.contactId || call.companyId) && call.followUpDate ? `voice-follow-up-${call.id}` : null;
     await this.persistCall(call);
     await this.persistCrmOutcome(call);
     return { call: safeCall(call) };
   }
 
   private async persistCrmOutcome(call: VoiceCall) {
-    if (!call.contactId) return;
+    const recordType = call.contactId ? "contact" : call.companyId ? "company" : null;
+    const recordId = call.contactId || call.companyId;
+    if (!recordType || !recordId) return;
     const now = new Date().toISOString();
     const activityId = `voice-call-${call.id}`;
     const activity = {
       id: activityId, type: "call", title: `Call outcome: ${call.outcome}`,
       detail: [call.destination, call.durationSeconds === null ? "Duration unavailable" : `${call.durationSeconds}s`, call.note].filter(Boolean).join(" · "),
-      recordType: "contact", recordId: call.contactId, user: "Voice call", createdAt: call.endedAt || now,
+      recordType, recordId, user: "Voice call", createdAt: call.endedAt || now,
     };
     const taskId = `voice-follow-up-${call.id}`;
     const task = call.followUpDate ? {
       id: taskId, title: `Follow up after call`, description: call.note || `Call follow-up for ${call.destination}`,
-      type: "Call follow-up", recordType: "contact", recordId: call.contactId, owner: "",
+      type: "Call follow-up", recordType, recordId, owner: "",
       priority: "Medium", dueDate: call.followUpDate, status: "To Do", completedAt: "", notes: "",
       createdAt: now, updatedAt: now,
     } : null;
     if (this.storage) {
       const activityResult = await this.storage.from("crm_activities").upsert({ user_id: call.userId, id: activityId, position: 0, payload: activity, updated_at: now }, { onConflict: "user_id,id" });
-      if (activityResult.error) throw new ServiceUnavailableException("The call is saved, but its contact timeline could not be updated.");
+      if (activityResult.error) throw new ServiceUnavailableException(`The call is saved, but its ${recordType} timeline could not be updated.`);
       if (task) {
         const taskResult = await this.storage.from("crm_tasks").upsert({ user_id: call.userId, id: taskId, position: 0, payload: task, updated_at: now }, { onConflict: "user_id,id" });
         if (taskResult.error) throw new ServiceUnavailableException("The call is saved, but its follow-up task could not be created.");
