@@ -18,6 +18,20 @@ services:
         sync: false
       - key: PUBLIC_API_URL
         sync: false
+      - key: TELNYX_API_KEY
+        sync: false
+      - key: TELNYX_SIP_CONNECTION_ID
+        sync: false
+      - key: TELNYX_VOICE_APPLICATION_ID
+        sync: false
+      - key: TELNYX_PHONE_NUMBER
+        sync: false
+      - key: TELNYX_PHONE_NUMBER_UK
+        sync: false
+      - key: TELNYX_PUBLIC_KEY
+        sync: false
+      - key: TELNYX_PARK_OUTBOUND_CALLS
+        value: "false"
       - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_ANON_KEY

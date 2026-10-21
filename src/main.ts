@@ -3,11 +3,15 @@ import { ConfigService } from "@nestjs/config";
 import { NestFactory } from "@nestjs/core";
 import { NestExpressApplication } from "@nestjs/platform-express";
 import { AppModule } from "./app.module";
+import { TelnyxVoiceProvider } from "./voice/voice-provider";
 
 async function bootstrap() {
   const app = await NestFactory.create<NestExpressApplication>(AppModule, { rawBody: true });
   app.useBodyParser("json", { limit: "10mb" });
   const config = app.get(ConfigService);
+  const voiceProvider = app.get(TelnyxVoiceProvider);
+  const voiceReadiness = voiceProvider.readiness();
+  if (!voiceReadiness.configured) console.warn(`Telnyx browser calling is disabled until configured (${voiceReadiness.missing.join(", ")}). CRM startup will continue.`);
   const environment = config.get<string>("NODE_ENV") || process.env.NODE_ENV || "development";
   const defaultProvider = (config.get<string>("EMAIL_PROVIDER") || "gmail").trim().toLowerCase();
   if (!["gmail", "ses", "resend"].includes(defaultProvider)) throw new Error("EMAIL_PROVIDER must be gmail, ses, or resend.");
