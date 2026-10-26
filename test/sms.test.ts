@@ -37,6 +37,11 @@ function harness(provider = new FakeSmsProvider()) {
             { id: "contact-1", phone: "+14155550199", archived: false },
             { id: "archived-contact", phone: "+14155550188", archived: true },
           ],
+          companies: [
+            { id: "company-1", customFields: { Phone: "+442079460958" }, archived: false },
+            { id: "archived-company", phone: "+442079460000", archived: true },
+            { id: "no-phone-company", name: "No phone", archived: false },
+          ],
         },
       };
     },
@@ -87,6 +92,24 @@ test("SMS sends use the CRM contact number, persist history, and are idempotent"
   assert.equal(provider.sendCount, 1);
   assert.equal((await service.listMessages("user-a")).messages.length, 1);
   assert.equal((await service.listMessages("user-b")).messages.length, 0);
+});
+
+test("SMS can be linked to a company and uses its stored phone number", async () => {
+  const { service, provider } = harness();
+  const result = await service.sendMessage("user-a", request({ contactId: undefined, companyId: "company-1" }));
+  assert.equal(result.message.contactId, null);
+  assert.equal(result.message.companyId, "company-1");
+  assert.equal(result.message.destination, "+442079460958");
+  assert.equal(provider.sendCount, 1);
+});
+
+test("SMS rejects missing, ambiguous, archived, or phone-less records", async () => {
+  const { service } = harness();
+  await assert.rejects(service.sendMessage("user-a", request({ contactId: undefined })), /Select either a contact or a company/);
+  await assert.rejects(service.sendMessage("user-a", request({ companyId: "company-1" })), /Select either a contact or a company/);
+  await assert.rejects(service.sendMessage("user-a", request({ contactId: undefined, companyId: "archived-company" })), NotFoundException);
+  await assert.rejects(service.sendMessage("user-a", request({ contactId: undefined, companyId: "unknown-company" })), NotFoundException);
+  await assert.rejects(service.sendMessage("user-a", request({ contactId: undefined, companyId: "no-phone-company" })), /valid US or UK phone number/);
 });
 
 test("concurrent requests with the same key create one SMS", async () => {

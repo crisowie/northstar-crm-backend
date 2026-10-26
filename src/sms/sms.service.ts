@@ -18,7 +18,8 @@ type SmsMessage = {
   id: string;
   userId: string;
   idempotencyKey: string;
-  contactId: string;
+  contactId: string | null;
+  companyId: string | null;
   destination: string;
   senderNumber: string;
   body: string;
@@ -37,7 +38,8 @@ function fromRow(row: Record<string, any>): SmsMessage {
     id: row.id,
     userId: row.user_id,
     idempotencyKey: row.idempotency_key,
-    contactId: row.contact_id,
+    contactId: row.contact_id || null,
+    companyId: row.company_id || null,
     destination: row.destination,
     senderNumber: row.sender_number,
     body: row.body,
@@ -56,6 +58,7 @@ function toRow(message: SmsMessage) {
     user_id: message.userId,
     idempotency_key: message.idempotencyKey,
     contact_id: message.contactId,
+    company_id: message.companyId,
     destination: message.destination,
     sender_number: message.senderNumber,
     body: message.body,
@@ -72,6 +75,7 @@ function safeMessage(message: SmsMessage) {
   return {
     id: message.id,
     contactId: message.contactId,
+    companyId: message.companyId,
     destination: message.destination,
     senderNumber: message.senderNumber,
     body: message.body,
@@ -162,9 +166,15 @@ export class SmsService {
     if (!body || typeof body !== "object" || Array.isArray(body)) throw new BadRequestException("SMS details are required.");
     const input = body as Record<string, unknown>;
     if (input.consentConfirmed !== true) throw new BadRequestException("Confirm that the recipient consented to receive SMS before sending.");
-    if (typeof input.contactId !== "string" || input.contactId.trim().length === 0 || input.contactId.length > 120) {
-      throw new BadRequestException("Select a contact to receive the SMS.");
+    if (input.contactId !== undefined && input.contactId !== null && (typeof input.contactId !== "string" || input.contactId.trim().length > 120)) {
+      throw new BadRequestException("Contact ID must be text with at most 120 characters.");
     }
+    if (input.companyId !== undefined && input.companyId !== null && (typeof input.companyId !== "string" || input.companyId.trim().length > 120)) {
+      throw new BadRequestException("Company ID must be text with at most 120 characters.");
+    }
+    const contactId = typeof input.contactId === "string" ? input.contactId.trim() || null : null;
+    const companyId = typeof input.companyId === "string" ? input.companyId.trim() || null : null;
+    if (Boolean(contactId) === Boolean(companyId)) throw new BadRequestException("Select either a contact or a company to receive the SMS.");
     if (typeof input.text !== "string" || input.text.trim().length === 0 || input.text.length > 1600) {
       throw new BadRequestException("SMS text must be between 1 and 1,600 characters.");
     }
@@ -180,9 +190,17 @@ export class SmsService {
     }
 
     const { data } = await this.workspace.getWorkspace(userId);
-    const contact = data.contacts.find((item) => item.id === input.contactId && !item.archived);
-    if (!contact) throw new NotFoundException("The selected contact was not found in your workspace.");
-    const destination = normalizeVoiceNumber(contact.phone).e164;
+    const contact = contactId ? data.contacts.find((item) => item.id === contactId && !item.archived) : undefined;
+    const company = companyId ? data.companies.find((item) => item.id === companyId && !item.archived) : undefined;
+    if (contactId && !contact) throw new NotFoundException("The selected contact was not found in your workspace.");
+    if (companyId && !company) throw new NotFoundException("The selected company was not found in your workspace.");
+    const companyCustomFields = company?.customFields;
+    const companyPhone = company
+      ? company.phone || (companyCustomFields && typeof companyCustomFields === "object"
+        ? Object.entries(companyCustomFields).find(([key, value]) => /^phone$/i.test(key) && typeof value === "string")?.[1]
+        : "")
+      : "";
+    const destination = normalizeVoiceNumber(contact ? contact.phone : companyPhone).e164;
 
     await this.enforceRateLimit(userId);
     if (!this.storage) {
@@ -194,7 +212,8 @@ export class SmsService {
       id: randomUUID(),
       userId,
       idempotencyKey,
-      contactId: input.contactId,
+      contactId,
+      companyId,
       destination,
       senderNumber: readiness.senderNumber,
       body: input.text.trim(),
