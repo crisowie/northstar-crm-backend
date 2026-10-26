@@ -14,6 +14,8 @@ The API listens on `http://localhost:5000/api`. Keep OAuth/API credentials in th
 
 Telnyx browser calling setup, additive migrations 008 and 009, Railway environment variables, portal configuration, and the live-call checklist are documented in [docs/telnyx-voice-calling.md](docs/telnyx-voice-calling.md). Calling stays disabled until server configuration is complete and `TELNYX_PARK_OUTBOUND_CALLS=true` is explicitly set.
 
+Outbound one-to-one SMS uses the Telnyx API. Set `TELNYX_API_KEY` and `TELNYX_SMS_FROM_NUMBER` (or reuse `TELNYX_PHONE_NUMBER` when that number is SMS-enabled), then apply `supabase/migrations/010_telnyx_sms.sql`. The sender must be authorized for SMS and meet Telnyx registration requirements for each destination. Sends require an authenticated CRM user and per-message confirmation of recipient consent; the API limits sends to 20 per user per hour and stores message history server-side. SMS delivery receipts and inbound messages are not currently synchronized.
+
 ## Gmail mailbox
 
 1. Enable the Gmail API in a Google Cloud project.
