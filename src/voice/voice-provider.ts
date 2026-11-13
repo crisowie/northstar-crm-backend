@@ -1,4 +1,4 @@
-import { Injectable } from "@nestjs/common";
+import { Inject, Injectable } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import Telnyx from "telnyx";
 import { parseCallerId, type SupportedVoiceCountry } from "./phone";
@@ -46,7 +46,7 @@ export interface VoiceProvider {
 export class TelnyxVoiceProvider implements VoiceProvider {
   private clientInstance: Telnyx | null = null;
 
-  constructor(private readonly config: ConfigService) {}
+  constructor(@Inject(ConfigService) private readonly config: ConfigService) {}
 
   private value(name: string): string {
     return (this.config.get<string>(name) || "").trim();
