@@ -9,6 +9,6 @@ import { VoiceService } from "./voice.service";
   imports: [WorkspaceModule],
   controllers: [VoiceController, VoiceWebhookController],
   providers: [SupabaseAuthGuard, TelnyxVoiceProvider, { provide: VOICE_PROVIDER, useExisting: TelnyxVoiceProvider }, VoiceService],
-  exports: [TelnyxVoiceProvider],
+  exports: [TelnyxVoiceProvider, ],
 })
 export class VoiceModule {}

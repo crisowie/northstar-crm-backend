@@ -30,18 +30,31 @@ async function bootstrap() {
   const missingDefaultConfig = (requiredByProvider[defaultProvider] || []).filter((key) => !config.get<string>(key)?.trim());
   if (defaultProvider === "gmail" && !encryptionKey) missingDefaultConfig.push("ENCRYPTION_KEY or GMAIL_TOKEN_ENCRYPTION_KEY");
   if (missingDefaultConfig.length) console.warn(`EMAIL_PROVIDER=${defaultProvider} has incomplete environment defaults (${missingDefaultConfig.join(", ")}). Add credentials in Email Providers settings or configure the missing server environment values.`);
-  const allowedOrigins = (config.get<string>("FRONTEND_ORIGIN") || "http://localhost:5173")
-    .split(",")
-    .map((origin) => origin.trim())
-    .filter(Boolean);
+ const allowedOrigins = (config.get<string>("FRONTEND_ORIGIN") || "http://localhost:5173")
+  .split(",")
+  .map((origin) => origin.trim().replace(/\/+$/, ""))
+  .filter(Boolean);
 
-  app.setGlobalPrefix("api");
-  app.enableCors({
-    origin: allowedOrigins,
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-  });
+console.log("Allowed CORS origins:", allowedOrigins);
 
+app.setGlobalPrefix("api");
+
+app.enableCors({
+  origin: allowedOrigins,
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: [
+    "Content-Type",
+    "Authorization",
+    "apikey",
+    "x-client-info",
+    "x-supabase-api-version",
+    "x-supabase-client-platform",
+    "x-supabase-client-version",
+    "x-supabase-client-runtime",
+    "x-supabase-client-runtime-version",
+  ],
+  credentials: true,
+});
   const port = Number(config.get<string>("PORT") || 5000);
   const host = config.get<string>("HOST") || (environment === "production" ? "0.0.0.0" : "127.0.0.1");
   await app.listen(port, host);
